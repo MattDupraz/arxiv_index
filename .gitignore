@@ -1,0 +1,22 @@
+# The index itself: ~870 MB of derived data, rebuilt from the arXiv API or the
+# Kaggle snapshot. papers.db is the only thing here that is expensive to
+# recreate, but it is data rather than source, so it is backed up rather than
+# committed.
+index/
+
+# The Kaggle metadata dump, 5.5 GB. Needed only to backfill a new category.
+arxiv-metadata-oai-snapshot.json
+
+# Model weights live in ~/.cache/huggingface and Ollama's store, never here.
+models/
+*.gguf
+*.safetensors
+
+# Run output
+*.log
+gpucore.*
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
