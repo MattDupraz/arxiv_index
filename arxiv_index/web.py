@@ -771,7 +771,7 @@ mark { background: var(--accent-soft); color: inherit; }
     <button type="submit" id="go">Search</button>
   </form>
   <div class="opts">
-    <label>Author <input type="text" id="author" placeholder="Kollár  ·  Larson, Payne"
+    <label>Author <input type="text" id="author" placeholder="Noether  ·  Hardy, Littlewood"
                         title="Several names, comma-separated, match papers they wrote together"
                         autocomplete="off"></label>
     <span>Categories:</span>
@@ -811,7 +811,7 @@ const reranking = () => { const b = $("#rerank"); return !!b && b.checked; };
 
      1. Real maths between $…$ or \(…\) — handed to KaTeX.
      2. Accents and special letters in ordinary prose, above all in author
-        names and titles: Gr\"obner, Erd\H{o}s, \c{c}, \ss. These sit OUTSIDE
+        names and titles: M\"obius, Erd\H{o}s, \c{c}, \ss. These sit OUTSIDE
         maths mode, so KaTeX never sees them and they would otherwise show up
         as literal backslashes.
 

@@ -30,9 +30,9 @@ def score_all(matrix, query: np.ndarray) -> np.ndarray:
 def author_ids(db, author: str):
     """Ids whose author list contains `author`, compared on folded names.
 
-    Both sides go through textnorm.fold, so "Kollar", "kollar" and "Kollár" all
-    match the stored "Koll\\'ar". Scanning 145k rows takes well under a second,
-    which is cheaper than maintaining a normalised column.
+    Both sides go through textnorm.fold, so "Poincare", "poincare" and
+    "Poincaré" all match the stored "Poincar\\'e". Scanning 145k rows takes well
+    under a second, which is cheaper than maintaining a normalised column.
     """
     terms = textnorm.fold_terms(author)
     if not terms:

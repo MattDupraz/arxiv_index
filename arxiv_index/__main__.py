@@ -237,8 +237,8 @@ def main(argv=None) -> None:
                    help="restrict to a category (repeatable)")
     p.add_argument("--author", metavar="NAME[,NAME...]",
                    help="restrict to papers by these authors (all of them, so "
-                        "'Larson,Payne' finds their joint work); accents and "
-                        "case are ignored")
+                        "'Hardy,Littlewood' finds their joint work); accents "
+                        "and case are ignored")
     p.add_argument("--since", metavar="YYYY-MM-DD", help="only papers this recent")
     p.add_argument("--rerank", action="store_true",
                    help=f"rescore the top {config.RERANK_CANDIDATES} hits with "

@@ -1,17 +1,18 @@
 """Normalising arXiv's LaTeX author strings for search.
 
-13.8% of records write author names as LaTeX: "J\\'er\\'emy Blanc",
-"Daniela K\\\"uhn", "Mikkel {\\O}bro". Matching a typed name against that raw
-text is hopeless -- LIKE '%Kollar%' finds a single paper out of the many by
-Kollár -- so names are reduced to a plain lowercase ASCII-ish form first.
+13.8% of records write author names as LaTeX -- "Poincar\\'e", "M\\\"obius",
+"{\\O}re". Matching a typed name against that raw text is hopeless: for one
+surname in the corpus, LIKE on the unaccented spelling finds a single paper out
+of the 166 by that author. So names are reduced to a plain lowercase ASCII-ish
+form first.
 
 Two steps, deliberately separate:
 
-  latex_to_unicode   "Koll\\'ar"  -> "Kollár"     (what a human would write)
-  fold               "Kollár"     -> "kollar"     (what we compare)
+  latex_to_unicode   "Poincar\\'e"  -> "Poincaré"   (what a human would write)
+  fold               "Poincaré"     -> "poincare"   (what we compare)
 
-Folding both sides means a search for "kollar", "Kollar" or "Kollár" all hit
-the same papers, which is what someone typing a name actually expects.
+Folding both sides means a search for "poincare", "Poincare" or "Poincaré" all
+hit the same papers, which is what someone typing a name actually expects.
 
 The web UI carries an equivalent routine in JavaScript for *display*; this one
 exists for *matching*, and the two are intentionally allowed to differ (display
@@ -40,7 +41,7 @@ _ACCENT_RE = re.compile(
     r"\\([\"'`^~=.]|[uvHckrdb])\s*\{([A-Za-zıȷ])\}"
     r"|\\([\"'`^~=.])\s*([A-Za-zıȷ])"
 )
-# Affiliations ride along in some records: "Krattenthaler (Universit\"at Wien)".
+# Affiliations ride along in some records: "Noether (Universit\"at G\"ottingen)".
 # Dropping them keeps a search for a place name from matching every author there.
 _PARENS = re.compile(r"\([^()]*\)")
 
@@ -67,7 +68,7 @@ def latex_to_unicode(text: str) -> str:
         return ""
     text = _LETTER_RE.sub(lambda m: _LETTERS.get(m.group(1), m.group(0)), text)
     text = _ACCENT_RE.sub(_accent, text)
-    # Braces are grouping, never content: "{\O}bro" has already become "{Ø}bro".
+    # Braces are grouping, never content: "{\O}re" has already become "{Ø}re".
     text = text.replace("{", "").replace("}", "")
     return " ".join(text.split())
 
@@ -78,16 +79,16 @@ _TERM_SPLIT = re.compile(r"[,;]|\s+and\s+", re.IGNORECASE)
 def fold_terms(query: str):
     """Split an author query into folded terms that must ALL match.
 
-    "Larson, Payne" means the papers those two wrote together, so the terms are
+    "Hardy, Littlewood" means the papers those two wrote together, so terms are
     combined with AND -- the reading that makes a multi-name query useful, and
     the one that narrows rather than widens.
 
-    Writing one name the other way round, "Larson, Hannah", also works, and in
-    fact does better than "Hannah Larson": the terms are matched independently,
-    so it still finds "Hannah K. Larson", whom the contiguous form misses.
+    Writing one name the other way round, "Hardy, Godfrey", also works, and in
+    fact does better than "Godfrey Hardy": the terms are matched independently,
+    so it still finds "Godfrey H. Hardy", whom the contiguous form misses.
 
-    The trade-off is that terms need not belong to the same person, so
-    "Larson, Hannah" would also admit a paper by "Hannah Smith and Bob Larson".
+    The trade-off is that terms need not belong to the same person: a paper by
+    one author called Godfrey and a different one called Hardy matches too.
     That is the price of letting one comma mean both "and this other author"
     and "surname first", and the multi-author reading is the useful one.
     """

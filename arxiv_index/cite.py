@@ -35,21 +35,21 @@ def arxiv_year(paper_id: str, fallback: str = None):
 def split_authors(raw: str):
     """arXiv stores authors as free text, in two different shapes.
 
-    The snapshot writes "C. Balazs, E. L. Berger, P. M. Nadolsky" while the API
-    (and some snapshot rows) write "Ileana Streinu and Louis Theran". Both
+    The snapshot writes "G. H. Hardy, J. E. Littlewood, G. Polya" while the API
+    (and some snapshot rows) write "Emmy Noether and Bernhard Riemann". Both
     separators appear, sometimes in the same string, so normalise then split.
     """
     if not raw:
         return []
     text = " ".join(raw.split())
-    # Case-insensitive: "Kenny, And Colum Watt" occurs in the corpus, and
-    # treating that "And" as part of a name yields "... and And Colum Watt",
-    # which biber rejects as a malformed name list.
+    # Case-insensitive: forms like "Hardy, And John Littlewood" occur in the
+    # corpus, and treating that "And" as part of a name yields "... and And
+    # John Littlewood", which biber rejects as a malformed name list.
     text = re.sub(r"\s+and\s+", ", ", text, flags=re.IGNORECASE)
     parts = []
     for part in text.split(","):
-        # Doubled separators occur verbatim in the corpus ("Xavier Goaoc and
-        # and Isaac Mabillard"). The first match consumes the whitespace the
+        # Doubled separators occur verbatim in the corpus ("Godfrey Hardy and
+        # and John Littlewood"). The first match consumes the whitespace the
         # second one needed, so a stray "and" survives into the name and biber
         # then reads an empty author. Strip any that are left over.
         part = re.sub(r"^(?:and\s+)+", "", part.strip(), flags=re.IGNORECASE)

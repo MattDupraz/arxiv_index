@@ -207,11 +207,12 @@ visible by eye.
 ## Author matching
 
 **Names match regardless of case and accents**, because arXiv stores 13.8% of
-author fields as LaTeX (`J\'anos Koll\'ar`, `Mikkel {\O}bro`). A literal
-`LIKE '%Kollar%'` finds **1** paper; folding both sides to lowercase ASCII finds
-**166**. Affiliations riding along in the field are stripped, so a place name
-does not match everyone who works there. `textnorm.py` splits this into
-`latex_to_unicode` (what a human would write) and `fold` (what is compared).
+author fields as LaTeX (`Poincar\'e`, `Erd\H{o}s`, `{\O}re`). Taking one surname
+in the corpus: a literal `LIKE` on its ASCII spelling finds **1** paper, while
+folding both sides to lowercase ASCII finds **166**. Affiliations riding along
+in the field are stripped, so a place name does not match everyone who works
+there. `textnorm.py` splits this into `latex_to_unicode` (what a human would
+write) and `fold` (what is compared).
 
 The two modes reach different sets, deliberately. **With a query**, only embedded
 papers can be returned — ranking needs a vector. **Without one**, the search is

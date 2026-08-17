@@ -109,8 +109,8 @@ rendered with a vendored copy of KaTeX, so the whole thing works offline.
 ```bash
 python3 -m arxiv_index search "toric degenerations of flag varieties"
 python3 -m arxiv_index search "chromatic polynomial" -k 20 --category math.CO
-python3 -m arxiv_index search "singularities of pairs" --author Kollar
-python3 -m arxiv_index search --author "Larson, Payne"     # no query needed
+python3 -m arxiv_index search "singularities of pairs" --author Noether
+python3 -m arxiv_index search --author "Hardy, Littlewood"  # no query needed
 python3 -m arxiv_index similar 0704.0002
 ```
 
@@ -140,19 +140,21 @@ vector lookup, so it is worth leaving off when skimming.
 Works alone — leave the query empty for that author's papers newest-first — or
 alongside a query, which then ranks their work by relevance to it.
 
-**Several names, comma-separated, mean papers written *together*.** `Larson,
-Payne` returns the 8 Larson–Payne collaborations, not the 197 papers either
-wrote. `;` and `and` also separate. A single name written surname-first,
-`Larson, Hannah`, works too and does better than `Hannah Larson`: the terms match
-independently, so it also finds "Hannah K. Larson". The trade-off is that the
-terms need not belong to one person, so it would admit "Hannah Smith and Bob
-Larson" — the price of one comma meaning both things.
+**Several names, comma-separated, mean papers written *together*.** `Hardy,
+Littlewood` returns only their joint papers — for one pair in this index, 8 of
+them rather than the 197 written by one or the other. `;` and `and` also
+separate. A single name written surname-first, `Hardy, Godfrey`, works too and
+does better than `Godfrey Hardy`: the terms match independently, so it also
+finds "Godfrey H. Hardy". The trade-off is that the terms need not belong to one
+person — a paper by someone called Godfrey and someone else called Hardy matches
+too — the price of one comma meaning both things.
 
 **Names match regardless of case and accents**, since arXiv stores many author
-fields as LaTeX (`J\'anos Koll\'ar`, `Mikkel {\O}bro`). Searching `Kollar`
-returns 166 papers; a literal substring match would return the 1 that happens to
-be spelled without the accents. Affiliations riding along in the field are
-stripped, so a place name does not match everyone who works there.
+fields as LaTeX (`Poincar\'e`, `Erd\H{o}s`, `{\O}re`). Typing the plain ASCII
+spelling of one surname in the corpus returns its 166 papers; a literal
+substring match returns the 1 record that happens to be written without the
+accents. Affiliations riding along in the field are stripped, so a place name
+does not match everyone who works there.
 
 One asymmetry worth knowing: **with** a query, only embedded papers can come
 back, because ranking needs a vector. **Without** one, the listing is pure
