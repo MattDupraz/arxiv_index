@@ -182,6 +182,39 @@ abstracts 1.94e-05 apart traded places because both round to exactly 0.719727 in
 float16. Same papers, arbitrary order between two of them. `GPU_SEARCH = False`
 restores bit-identical agreement with the CLI.
 
+### What the server holds
+
+Resident set of the `serve` process, measured on the 145k-paper index:
+
+| | RSS | anonymous |
+|---|---|---|
+| CPU search (`GPU_SEARCH = False`) | 840 MB | **98 MB** |
+| GPU search | 1.0 GB | 566 MB |
+| after one reranked search | 2.1 GB | 1.5 GB |
+
+Only the anonymous column is memory the kernel cannot take back. On the CPU path
+the other 742 MB is the vector file mapped in: clean page-cache, evicted under
+pressure and re-read from disk, so the server nominally holding 840 MB does not
+mean 840 MB is unavailable to anything else.
+
+Almost everything above 100 MB is torch: ~480 MB to import it and open a HIP
+context, and another ~700 MB the first time a kernel runs, which is ROCm loading
+its kernel libraries and is not returned afterwards. That cost is per-process and
+independent of corpus size. It buys the 149× search speed-up and the reranker; if
+neither is wanted, `GPU_SEARCH = False` and leaving **Rerank** unticked keeps the
+process under 100 MB of real memory.
+
+Two things keep the rest small, both of which had to be built rather than freed —
+CPython returns very little to the OS once it has grown:
+
+- **The host copy of the matrix is dropped after the upload to VRAM.** Nothing
+  reads it again while `gpu` is set, and the upload has just paged all 747 MB in.
+- **Per-row metadata is streamed and pooled.** `fetchall()` on 145k rows is ~65 MB
+  of `sqlite3.Row` objects that a build re-pays every few seconds, and the rows
+  are mostly repetition: 5.2k distinct dates and 4.6k distinct category sets
+  across 145k papers, plus every folded author string built twice. Holding one
+  instance of each turns 47 MB of category sets into under one.
+
 ### Reranking
 
 The index is a *bi-encoder*: query and document are embedded separately, so their

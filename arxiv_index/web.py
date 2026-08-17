@@ -3,9 +3,10 @@
     python -m arxiv_index serve
 
 Runs on the standard library alone. The point of a resident server is that the
-vector matrix is loaded once and stays mapped, so a search costs one embedding
-call plus one matrix-vector product -- rather than the CLI's re-open of the
-whole file on every invocation.
+vector matrix is loaded once and stays put -- in VRAM when there is a GPU,
+mapped from the file otherwise -- so a search costs one embedding call plus one
+matrix-vector product, rather than the CLI's re-open of the whole file on every
+invocation.
 
 Filtering is applied *after* scoring here, unlike the CLI. The CLI pre-filters
 in SQL to avoid touching rows it does not need, but that gathers the matching
@@ -20,6 +21,7 @@ import datetime as dt
 import json
 import mimetypes
 import pathlib
+import signal
 import threading
 import time
 import webbrowser
@@ -47,12 +49,31 @@ class ResidentIndex:
         self.db = store.connect(check_same_thread=False)
         store.check_model(self.db)
         self.ids = []
+        self.matrix = None
         self.loaded = 0
         self.meta_loaded = -1
         self.gpu = None          # matrix in VRAM, when available
         self.torch = None
+        # Values that repeat across rows, held once. See _shared().
+        self._pool = {}
         self.reload()
         self.reload_metadata()
+
+    def _shared(self, value):
+        """The canonical instance of `value`, so equal values cost one object.
+
+        The per-row metadata is mostly repetition: 145k rows carry 5.2k distinct
+        dates and 4.6k distinct category sets between them, and every folded
+        author string is built twice -- once for the embedded rows, once for the
+        metadata table. Pooling them turns 47 MB of category sets into well
+        under one, and is why the two author lists share their strings rather
+        than holding a copy each.
+
+        The pool is never pruned. It only ever holds values still present in the
+        corpus, minus whatever a deleted paper leaves behind, which is bounded
+        by the vocabulary rather than by the number of rows.
+        """
+        return self._pool.setdefault(value, value)
 
     def _to_gpu(self) -> None:
         """Mirror the matrix into VRAM. Falls back silently to the CPU path.
@@ -60,6 +81,12 @@ class ResidentIndex:
         Re-uploaded on every reload, so the old tensor is dropped first --
         during a build reload happens often, and leaking 747 MB each time would
         exhaust VRAM quickly.
+
+        On success the host copy is released. Once the vectors are in VRAM
+        nothing reads them from RAM again, and the upload has just touched every
+        page of the file: keeping the mapping would hold 747 MB resident for a
+        fallback that cannot be taken while `gpu` is set. Dropping it is free --
+        `reload()` re-maps from scratch anyway.
         """
         self.gpu = None
         if not config.GPU_SEARCH or not len(self.ids):
@@ -77,39 +104,58 @@ class ResidentIndex:
                 np.ascontiguousarray(self.matrix)).to("cuda")
         except Exception:  # noqa: BLE001 - VRAM pressure, driver issues, ...
             self.gpu = None
+        else:
+            self.matrix = None
 
     def score(self, vector):
         """Cosine against every embedded paper, on the GPU when it is there."""
-        if self.gpu is None:
-            return search_mod.score_all(self.matrix, vector)
+        # Snapshot both, matrix first: a reload running in another thread swaps
+        # the pair, and the local reference keeps whichever one this query picks
+        # alive for the duration of the scan.
+        matrix, gpu = self.matrix, self.gpu
+        if gpu is None:
+            return search_mod.score_all(matrix, vector)
         query = self.torch.from_numpy(np.ascontiguousarray(vector)).to(
             "cuda").half()
-        return (self.gpu @ query).float().cpu().numpy()
+        return (gpu @ query).float().cpu().numpy()
 
     def _rows(self, sql: str, params=()):
         with self._db_lock:
             return self.db.execute(sql, params).fetchall()
 
     def reload(self) -> None:
-        with self._db_lock:
-            rows = self.db.execute(
-                "SELECT id, row, categories, update_date, authors FROM papers "
-                "WHERE row IS NOT NULL ORDER BY row"
-            ).fetchall()
-            self.matrix, _ = store.load_matrix(self.db)
-        self.ids = [r["id"] for r in rows]
-        self.dates = np.array([r["update_date"] or "" for r in rows], dtype="U10")
-        # Folded once at load (~0.5s for the full corpus) rather than per query.
-        self.authors = [textnorm.fold(r["authors"] or "") for r in rows]
+        ids, dates, authors = [], [], []
         # One boolean column per category beats re-parsing category strings on
         # every query. These index the *matrix*, so they must be built from the
         # embedded rows in row order -- never from the metadata table, which is
         # a different length and a different order.
-        self.cat_masks = {
-            cat: np.array([cat in (r["categories"] or "").split() for r in rows])
-            for cat in config.CATEGORIES
-        }
-        self.loaded = len(self.ids)
+        masks = {cat: [] for cat in config.CATEGORIES}
+        with self._db_lock:
+            # Streamed rather than fetchall()'d. The full result is ~65 MB of
+            # sqlite3.Row objects, and freeing them does not hand the memory
+            # back: glibc keeps the arena and the process stays that size. Never
+            # allocating it is the only way not to pay for it -- which matters
+            # here because a build calls this every few seconds.
+            for row in self.db.execute(
+                "SELECT id, row, categories, update_date, authors FROM papers "
+                "WHERE row IS NOT NULL ORDER BY row"
+            ):
+                ids.append(row["id"])
+                dates.append(self._shared(row["update_date"] or ""))
+                # Folded once at load (~0.5s for the full corpus) rather than
+                # per query.
+                authors.append(
+                    self._shared(textnorm.fold(row["authors"] or "")))
+                cats = (row["categories"] or "").split()
+                for cat, mask in masks.items():
+                    mask.append(cat in cats)
+            self.matrix, _ = store.load_matrix(self.db)
+        self.ids = ids
+        self.dates = np.array(dates, dtype="U10")
+        self.authors = authors
+        self.cat_masks = {cat: np.array(mask, dtype=bool)
+                          for cat, mask in masks.items()}
+        self.loaded = len(ids)
         self._to_gpu()
 
     def reload_metadata(self) -> None:
@@ -121,16 +167,26 @@ class ResidentIndex:
         papers: mid-build that is half the corpus. Held newest-first so a
         listing can stop as soon as it has enough.
         """
+        ids, dates, cats, authors = [], [], [], []
         with self._db_lock:
-            rows = self.db.execute(
+            # Streamed and pooled, for the reasons given in reload().
+            for row in self.db.execute(
                 "SELECT id, categories, update_date, authors FROM papers "
                 "ORDER BY update_date DESC"
-            ).fetchall()
-        self.meta_ids = [r["id"] for r in rows]
-        self.meta_dates = [r["update_date"] or "" for r in rows]
-        self.meta_cats = [set((r["categories"] or "").split()) for r in rows]
-        self.meta_authors = [textnorm.fold(r["authors"] or "") for r in rows]
-        self.meta_loaded = len(rows)
+            ):
+                ids.append(row["id"])
+                dates.append(self._shared(row["update_date"] or ""))
+                # frozenset rather than set only so it can be pooled; the one
+                # use is an intersection, which works the same either way.
+                cats.append(
+                    self._shared(frozenset((row["categories"] or "").split())))
+                authors.append(
+                    self._shared(textnorm.fold(row["authors"] or "")))
+        self.meta_ids = ids
+        self.meta_dates = dates
+        self.meta_cats = cats
+        self.meta_authors = authors
+        self.meta_loaded = len(ids)
 
     def refresh_if_stale(self) -> None:
         """Pick up papers embedded since load. Cheap: the matrix is a memmap, so
@@ -330,6 +386,46 @@ class ResidentIndex:
         return results[:k], time.monotonic() - started, None
 
 
+GRACE_PERIOD = 10.0     # seconds to let in-flight requests finish on shutdown
+
+
+class GracefulHTTPServer(ThreadingHTTPServer):
+    """Threading server that lets in-flight requests finish before it closes.
+
+    Handler threads stay daemonic on purpose. With HTTP/1.1 keep-alive most of
+    them sit blocked on a read from an idle browser connection, and joining
+    those -- what ``daemon_threads = False`` would do -- would stall the exit
+    for as long as a tab stays open. What matters for a clean stop is the
+    requests actually being served, so those are counted here and waited on for
+    a bounded time instead.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._in_flight = 0
+        self._idle = threading.Condition()
+
+    def request_started(self):
+        with self._idle:
+            self._in_flight += 1
+
+    def request_finished(self):
+        with self._idle:
+            self._in_flight -= 1
+            if not self._in_flight:
+                self._idle.notify_all()
+
+    def drain(self, timeout: float = GRACE_PERIOD) -> int:
+        """Wait for in-flight requests; return how many were still running."""
+        deadline = time.monotonic() + timeout
+        with self._idle:
+            while self._in_flight:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or not self._idle.wait(remaining):
+                    break
+            return self._in_flight
+
+
 def make_handler(index: ResidentIndex):
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -373,6 +469,16 @@ def make_handler(index: ResidentIndex):
             self.wfile.write(body)
 
         def do_GET(self):
+            # Counted rather than hooking handle_one_request, which spends most
+            # of its life blocked waiting for the *next* request on an idle
+            # keep-alive connection -- that is not work worth draining for.
+            self.server.request_started()
+            try:
+                self._route()
+            finally:
+                self.server.request_finished()
+
+        def _route(self):
             parsed = urlparse(self.path)
             params = parse_qs(parsed.query)
             one = lambda key, default=None: params.get(key, [default])[0]
@@ -492,20 +598,48 @@ def serve(port: int = 8000, host: str = "127.0.0.1", open_browser: bool = True):
     print("Loading index ...")
     index = ResidentIndex()
     stats = index.stats()
-    size = index.matrix.nbytes / 1e6 if len(index.ids) else 0
-    print(f"{stats['embedded']:,} papers resident ({size:,.0f} MB)"
+    # Computed rather than read off the matrix, which is gone on the GPU path.
+    size = (len(index.ids) * config.DIM
+            * np.dtype(config.VEC_DTYPE).itemsize / 1e6)
+    where = "VRAM" if index.gpu is not None else "RAM"
+    print(f"{stats['embedded']:,} papers resident ({size:,.0f} MB in {where})"
           + (f", {stats['pending']:,} still embedding" if stats["pending"] else ""))
 
-    server = ThreadingHTTPServer((host, port), make_handler(index))
+    server = GracefulHTTPServer((host, port), make_handler(index))
     url = f"http://{host}:{port}/"
-    print(f"\n  {url}\n\nCtrl-C to stop.")
+    print(f"\n  {url}\n\nCtrl-C (or SIGTERM) to stop.")
     if open_browser:
         threading.Timer(0.5, lambda: webbrowser.open(url)).start()
+
+    stopping = threading.Event()
+
+    def stop(signum, _frame):
+        # Signal handlers run in the main thread, which is the one parked in
+        # serve_forever(); calling shutdown() from here would deadlock waiting
+        # on itself, so hand it to a helper thread. A second signal is ignored
+        # rather than escalated -- the grace period already bounds the wait.
+        if stopping.is_set():
+            return
+        stopping.set()
+        print(f"\n{signal.Signals(signum).name} -- finishing in-flight "
+              f"requests ...", flush=True)
+        threading.Thread(target=server.shutdown, daemon=True).start()
+
+    try:
+        signal.signal(signal.SIGTERM, stop)
+        signal.signal(signal.SIGINT, stop)
+    except ValueError:
+        pass            # not the main thread: fall back to KeyboardInterrupt
+
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        print("\nStopped.")
-        server.server_close()
+        print()
+
+    cut_short = server.drain()
+    server.server_close()
+    print(f"Stopped, {cut_short} request(s) cut short."
+          if cut_short else "Stopped.")
 
 
 PAGE = r"""<!doctype html>
