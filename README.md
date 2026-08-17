@@ -109,7 +109,7 @@ rendered with a vendored copy of KaTeX, so the whole thing works offline.
 ```bash
 python3 -m arxiv_index search "toric degenerations of flag varieties"
 python3 -m arxiv_index search "chromatic polynomial" -k 20 --category math.CO
-python3 -m arxiv_index search "singularities of pairs" --author Noether
+python3 -m arxiv_index search "invariant theory of finite groups" --author Noether
 python3 -m arxiv_index search --author "Hardy, Littlewood"  # no query needed
 python3 -m arxiv_index similar 0704.0002
 ```
