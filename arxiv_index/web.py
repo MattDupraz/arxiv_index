@@ -489,7 +489,7 @@ def make_handler(index: ResidentIndex):
                 # browser holding yesterday's copy would silently hide new UI.
                 # (The vendored assets under /static are immutable and are
                 # cached aggressively instead.)
-                self._send(PAGE.encode("utf-8"), "text/html; charset=utf-8",
+                self._send(page().encode("utf-8"), "text/html; charset=utf-8",
                            no_store=True)
                 return
 
@@ -778,8 +778,7 @@ mark { background: var(--accent-soft); color: inherit; }
     <label><input type="checkbox" class="cat" value="math.AC"> math.AC</label>
     <label><input type="checkbox" class="cat" value="math.AG"> math.AG</label>
     <label><input type="checkbox" class="cat" value="math.CO"> math.CO</label>
-    <label title="Rescores the top 50 hits with a cross-encoder that reads query and abstract together. Slower, better ordered.">
-      <input type="checkbox" id="rerank" checked> Rerank top 50</label>
+<!--RERANK-->
     <label title="Show the relevance logit and cosine for each hit">
       <input type="checkbox" id="showscores"> Scores</label>
     <label>Since <input type="date" id="since"></label>
@@ -801,6 +800,10 @@ mark { background: var(--accent-soft); color: inherit; }
 <script src="/static/auto-render.min.js"></script>
 <script>
 const $ = s => document.querySelector(s);
+
+// The rerank checkbox exists only when the server can rerank, so every reader
+// of it goes through here rather than assuming the element is there.
+const reranking = () => { const b = $("#rerank"); return !!b && b.checked; };
 
 /* ---- LaTeX -------------------------------------------------------------
    arXiv metadata is raw LaTeX in two distinct flavours, and they need
@@ -1032,7 +1035,8 @@ $("#f").onsubmit = e => {
   if (!q && !author && !since && !cats.length) return;
   const p = new URLSearchParams({q, k: $("#k").value});
   if (author) p.set("author", author);
-  if ($("#rerank").checked && q) p.set("rerank", "1");
+  // The control is absent when the server cannot rerank, so ask it that way.
+  if (reranking() && q) p.set("rerank", "1");
   document.querySelectorAll(".cat:checked").forEach(c => p.append("cat", c.value));
   if ($("#since").value) p.set("since", $("#since").value);
   run("/api/search?" + p, author && !q ? "by " + author + ", newest first" : null);
@@ -1081,7 +1085,7 @@ async function copyCite(card) {
 function similar(id, title) {
   // Honour the same checkbox as search: the cross-encoder scores a text pair
   // either way, with this paper's abstract standing in for the query.
-  const rr = $("#rerank").checked ? "&rerank=1" : "";
+  const rr = reranking() ? "&rerank=1" : "";
   run(`/api/similar?id=${encodeURIComponent(id)}&k=${$("#k").value}` + rr,
       "similar to " + deTeX(title).slice(0, 60));
 }
@@ -1089,3 +1093,23 @@ function similar(id, title) {
 </body>
 </html>
 """
+
+# Substituted into the page only when reranking could actually run. Offering a
+# checkbox that cannot work is worse than not offering one: it is ticked by
+# default, so the first search on a machine without torch pays for a 50-hit
+# shortlist and then explains itself in the status line. The JS treats the
+# control as optional throughout, so its absence just means no `rerank=1`.
+RERANK_CONTROL = """    <label title="Rescores the top 50 hits with a \
+cross-encoder that reads query and abstract together. Slower, better ordered.">
+      <input type="checkbox" id="rerank" checked> Rerank top 50</label>"""
+
+
+def page() -> str:
+    """The UI, with the rerank control included only if it is usable.
+
+    Rebuilt per request rather than cached: `offerable()` is cheap, and a
+    reranker that fails at run time -- an out-of-memory, a GPU that went away --
+    then stops being offered on the next refresh instead of at the next restart.
+    """
+    control = RERANK_CONTROL if rerank_mod.offerable() else ""
+    return PAGE.replace("<!--RERANK-->", control)

@@ -120,10 +120,11 @@ and `--json` prints full records.
 **Reranking** rescores the top 50 hits with a cross-encoder that reads the query
 and abstract together. It is markedly better ordering — known-item recall@1 goes
 from 0.50 to 0.86 — at about a second per search, and it needs torch and a GPU.
-The **Rerank** checkbox controls it in the web UI. It is skipped automatically
-for author-only listings, where there is no query to be relevant to, and if the
-model is missing or fails to load the search falls back to vector order and says
-so rather than failing.
+The **Rerank** checkbox controls it in the web UI, and appears only when torch
+and transformers are installed — there is no point offering an option that
+cannot run. Reranking is skipped automatically for author-only listings, where
+there is no query to be relevant to, and if the model fails to load the search
+falls back to vector order and says why rather than failing.
 
 **Scores are hidden by default** in both interfaces — they are diagnostics, not
 reading material. The **Scores** checkbox reveals them in the web UI and

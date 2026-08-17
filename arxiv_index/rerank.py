@@ -17,6 +17,9 @@ gain, because they project 2560 -> 151,936 per document only to read two of
 those numbers.
 """
 
+import importlib.util
+import sys
+
 from . import config
 
 # torch and transformers are imported lazily inside _Model.load(): they are
@@ -136,6 +139,38 @@ class _Model:
 
 def available() -> bool:
     return _Model.load()
+
+
+def offerable() -> bool:
+    """Whether the UI should offer reranking at all. Cheap: loads nothing.
+
+    `available()` answers the same question definitively, but it pays the model
+    load -- several seconds, and ~480 MB of resident torch that a server
+    configured without it would otherwise never hold. The page has to decide
+    before any search happens, so it cannot pay that.
+
+    So this answers only what can be known for free. A missing dependency is
+    conclusive, and a load that has already failed in this process is too. A GPU
+    that turns out to be absent is not detectable without importing torch, and
+    is left to the run-time path, which falls back to vector order and says why.
+    """
+    if _Model.model is not None:
+        return True
+    if _Model.failed:
+        return False
+    try:
+        if "torch" in sys.modules:
+            # Already paid for -- GPU_SEARCH imports it -- so ask the real
+            # question rather than only whether it is installed.
+            return sys.modules["torch"].cuda.is_available()
+        return all(importlib.util.find_spec(m) is not None
+                   for m in ("torch", "transformers"))
+    except Exception:  # noqa: BLE001
+        # A half-installed package can make find_spec raise rather than return
+        # None, and cuda.is_available() can fail on a broken driver. Either way
+        # the answer is "do not offer it"; rendering the page must not depend
+        # on the reranker being in a sane state.
+        return False
 
 
 def rerank(query: str, papers):
