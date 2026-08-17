@@ -7,6 +7,8 @@ A paper is in scope if **any** of its categories is one of the three, so
 cross-listed work (e.g. a `cs.CG math.CO` paper) counts. That is ~145,000 papers
 out of the snapshot's 3.1M.
 
+Once the index exists, day-to-day use is two commands:
+
 ```bash
 python3 -m arxiv_index serve      # http://127.0.0.1:8000/
 python3 -m arxiv_index update     # weekly top-up, about a minute
@@ -18,14 +20,87 @@ python3 -m arxiv_index update     # weekly top-up, about a minute
 | + reranking the top 50 | ~800 ms |
 | index | 145,853 papers, 747 MB of vectors |
 
-## Requirements
+## Where everything lives
 
-- **Ollama**, with the embedding model: `ollama pull qwen3-embedding:4b`
-- **Python 3.11+** with `numpy` and `ollama`
-- **torch + transformers** — only for reranking and GPU search; everything else
-  works without them
+This repository is **code only**. No data is committed, so a fresh clone can
+search nothing until you build the index — one 5.5 GB download and a few hours
+of embedding, both described in [First-time setup](#first-time-setup).
 
-The arXiv API client uses only the standard library.
+```
+arXiv_index/
+├── arxiv_index/                     the package — everything that is in git
+│   └── static/                      vendored KaTeX (no CDN; the UI works offline)
+├── arxiv-metadata-oai-snapshot.json Kaggle dump, 5.5 GB — initial backfill only
+└── index/                           the database; created by the first build
+    ├── papers.db                    SQLite, ~160 MB, one row per paper
+    ├── vectors.f16                  flat float16 vectors, ~750 MB
+    └── embed.lock                   empty file, advisory lock (see below)
+```
+
+Both paths come from `arxiv_index/config.py` — `INDEX_DIR` and `SNAPSHOT`,
+resolved relative to the repo root. Nothing else hardcodes a location, so
+pointing `INDEX_DIR` at an external disk moves the whole index. `python3 -m
+arxiv_index status` prints the directory in use, along with what is in it.
+
+Model weights are not here either. Ollama keeps the embedding model in its own
+store (`~/.ollama`, ~2.5 GB), and the reranker is downloaded to
+`~/.cache/huggingface` (~570 MB) the first time reranking is switched on.
+
+Nothing in `index/` is served over the network beyond the local web UI, and
+`serve` binds to `127.0.0.1` by default.
+
+### The two index files are a matched set
+
+`papers.db` is the source of truth: each paper's `row` column names its slot in
+`vectors.f16`, and the vector file has no identity of its own. **Back them up
+together, and copy them together.** If they do get separated, the vectors can be
+rebuilt from the metadata — one statement plus the embedding time:
+
+```bash
+sqlite3 index/papers.db "UPDATE papers SET row = NULL"
+rm index/vectors.f16
+python3 -m arxiv_index build --embed-only
+```
+
+The reverse does not work: `vectors.f16` on its own is anonymous numbers.
+
+`embed.lock` is created on demand and holds no state — deleting it while nothing
+is embedding is harmless.
+
+## First-time setup
+
+**1. Ollama, with the embedding model.**
+
+```bash
+ollama pull qwen3-embedding:4b
+```
+
+**2. Python 3.11+ with `numpy` and `ollama`.** The arXiv API client, the web
+server and the citation generator use only the standard library.
+
+**3. Optionally torch + transformers**, for reranking and GPU search. Everything
+else works without them; searches simply run on the CPU in vector order.
+
+**4. The Kaggle snapshot**, for the initial backfill only:
+[kaggle.com/datasets/Cornell-University/arxiv](https://www.kaggle.com/datasets/Cornell-University/arxiv).
+Unzip `arxiv-metadata-oai-snapshot.json` into the repo root (or set
+`config.SNAPSHOT`). It is 5.5 GB and can be deleted once the build finishes;
+after that the index keeps itself current from the arXiv API. There is no
+API-only backfill path — arXiv caps how deep a result set can be paged, so the
+snapshot is how the history gets in.
+
+**5. Build.**
+
+```bash
+python3 -m arxiv_index build     # scan the snapshot, then embed
+python3 -m arxiv_index status    # where the index is and what is in it
+python3 -m arxiv_index serve
+```
+
+The scan takes a couple of minutes; embedding 145k papers takes about three
+hours at 14 docs/s on the GPU this was developed on. It is interruptible —
+`build --embed-only` picks up exactly where it stopped, skipping the scan.
+Budget ~910 MB for the finished index, plus the 5.5 GB snapshot while it exists.
 
 ### Installing torch
 
@@ -34,9 +109,10 @@ pip install --user --index-url https://download.pytorch.org/whl/rocm7.0 torch
 pip install --user transformers
 ```
 
-ROCm 7.0 wheels recognise this machine's RDNA4 GPU (gfx1200) natively. Fedora's
-`python3-torch` will *not* do — it is a CPU-only build and there is no ROCm
-variant in the repos.
+That index URL is the ROCm 7.0 build, whose wheels recognise this machine's
+RDNA4 GPU (gfx1200) natively; pick the CUDA or CPU wheel for other hardware.
+A distribution package may not do — Fedora's `python3-torch`, for one, is a
+CPU-only build with no ROCm variant in the repos.
 
 Installed to `--user` rather than a virtualenv on purpose: it is one library, not
 a dependency set worth isolating, and a venv would mean two interpreters —
@@ -126,7 +202,7 @@ only for the initial backfill. Papers whose title or abstract changed are
 re-embedded; papers that merely gained a DOI are not.
 
 ```cron
-0 7 * * 1  cd /home/matt/Code/arXiv_index && python3 -m arxiv_index update >> update.log 2>&1
+0 7 * * 1  cd /path/to/arXiv_index && python3 -m arxiv_index update >> update.log 2>&1
 ```
 
 **Can it miss a paper?** The cursor advances *only* when a walk provably reached
@@ -156,8 +232,9 @@ index/papers.db     SQLite: metadata, one row per paper
 index/vectors.f16   flat float16 array, 2560 dims per paper
 ```
 
-`papers.row` is a paper's slot in the vector file, or `NULL` if it still needs
-embedding. **That single nullable column is the whole work queue**: every ingest
+Slot *n* of the vector file lives at byte offset `n * 2560 * 2`, and
+`papers.row` is a paper's slot, or `NULL` if it still needs embedding. **That
+single nullable column is the whole work queue**: every ingest
 path writes metadata with `row = NULL` and `embed_pending` drains it, so an
 interrupted build resumes exactly where it left off. The vector file is
 append-only; re-embedding a revision appends a slot and repoints the paper, and
@@ -349,7 +426,21 @@ Everything adjustable is in `arxiv_index/config.py`, with the measurements behin
 each choice in the comments. Changing `CATEGORIES` and re-running `build` adds
 categories without re-embedding what you have.
 
-## Files
+## Commands
+
+`python3 -m arxiv_index <command>`; every command takes `--help`.
+
+| | |
+|---|---|
+| `build` | backfill from the snapshot, then embed. `--embed-only` skips the scan |
+| `update` | fetch and embed what is new from the arXiv API |
+| `search` | semantic search; `--author`, `--category`, `--since`, `--rerank`, `--scores`, `--full`, `--json` |
+| `similar` | neighbours of a given arXiv id |
+| `serve` | the web UI; `--port`, `--host`, `--no-browser` |
+| `status` | index location, model, counts, cursor |
+| `compact` | reclaim vector slots left behind by re-embedded papers |
+
+## Source layout
 
 | | |
 |---|---|
