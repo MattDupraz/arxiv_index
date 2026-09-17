@@ -32,6 +32,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 import numpy as np
 
 from . import (cite, config, profile as profile_mod, rerank as rerank_mod,
+               schedule as schedule_mod,
                search as search_mod, store, textnorm, update as update_mod)
 
 # Vendored KaTeX (js, css, woff2 subset). Kept local rather than pulled from a
@@ -464,6 +465,27 @@ class ResidentIndex:
         with self._db_lock:
             return profile_mod.vectors(self.db)
 
+    # --- The automatic-update setting ---------------------------------------
+    # Same connection and lock as the profile. These are single `meta` rows,
+    # so unlike the embedding call in save_profile there is nothing here worth
+    # releasing the lock for.
+
+    def schedule(self) -> dict:
+        with self._db_lock:
+            return schedule_mod.load(self.db)
+
+    def save_schedule(self, raw) -> dict:
+        with self._db_lock:
+            return schedule_mod.save(self.db, raw)
+
+    def last_run(self) -> float:
+        with self._db_lock:
+            return schedule_mod.last_run(self.db)
+
+    def note_run(self, when) -> None:
+        with self._db_lock:
+            schedule_mod.note_run(self.db, when)
+
     def newest_date(self) -> str:
         """The most recent update_date held. The rows are date-sorted."""
         return self.meta_dates[0] if self.meta_dates else ""
@@ -648,6 +670,83 @@ class Updater:
         return payload
 
 
+class Scheduler:
+    """Presses "Fetch new papers" on a timer, for as long as `serve` is up.
+
+    The button exists because an index goes stale behind a server that is left
+    running; this is the same button, pressed by the clock instead. All of the
+    "when" lives in `schedule`, as pure functions over the setting and two
+    timestamps -- this class only supplies the clock, the thread and the
+    refusal to start a second run on top of a first.
+
+    Each tick re-reads the setting, so changing it in the UI takes effect
+    within the tick rather than at the next restart. The read is one `meta`
+    row, which is why polling is affordable enough to keep the alternative --
+    waking exactly at the due moment, and rearming whenever the setting
+    changes -- from being worth its extra machinery.
+
+    Runs are timed from when one last *started*, manual runs included: someone
+    who has just fetched by hand does not want the clock doing it again a
+    moment later. That record is persisted, so it survives a restart.
+    """
+
+    TICK = 30.0     # the finest the setting can express is an hour
+
+    def __init__(self, index, updater):
+        self._index = index
+        self._updater = updater
+        self._stop = threading.Event()
+        self._thread = None
+
+    def start(self) -> None:
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def _loop(self) -> None:
+        # wait() rather than sleep(): a stop lands within the tick instead of
+        # at the end of it. The first check is one tick in, which keeps the
+        # scheduler off the back of a server still loading its index.
+        while not self._stop.wait(self.TICK):
+            try:
+                self.tick()
+            except Exception as exc:    # noqa: BLE001 - a bad tick is not fatal
+                print(f"auto-update check failed: {exc}", flush=True)
+
+    def _last(self) -> float:
+        """When a run last started, by either route."""
+        return max(self._index.last_run(), self._updater.started or 0)
+
+    def tick(self, now=None) -> bool:
+        """Start a run if one is due. Returns whether it did."""
+        now = time.time() if now is None else now
+        setting = self._index.schedule()
+        if setting["mode"] == "off":
+            return False
+        if not schedule_mod.due(setting, self._last(), now):
+            return False
+        if not self._updater.start():
+            # One is already in flight -- a long backlog, or a manual run
+            # started seconds ago. Leave the record alone and ask again next
+            # tick, by which time that run will have set it.
+            return False
+        self._index.note_run(now)
+        print("auto-update: starting a scheduled run", flush=True)
+        return True
+
+    def status(self, now=None) -> dict:
+        now = time.time() if now is None else now
+        setting = self._index.schedule()
+        last = self._last()
+        return setting | {
+            "last_run": last or None,
+            "next_run": schedule_mod.next_run(setting, last, now),
+            "now": now,
+        }
+
+
 # A profile is two short text fields; anything near this is a mistake.
 MAX_BODY = 256 * 1024
 
@@ -691,7 +790,8 @@ class GracefulHTTPServer(ThreadingHTTPServer):
             return self._in_flight
 
 
-def make_handler(index: ResidentIndex, updater: Updater):
+def make_handler(index: ResidentIndex, updater: Updater,
+                 scheduler: "Scheduler"):
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
 
@@ -789,6 +889,14 @@ def make_handler(index: ResidentIndex, updater: Updater):
                     self._json(saved)
                     return
 
+                if path == "/api/schedule":
+                    if body is None:
+                        self._json({"error": "expected a JSON body"}, 400)
+                        return
+                    index.save_schedule(body)
+                    self._json(scheduler.status())
+                    return
+
                 if path == "/api/update":
                     # POST, not GET: this walks the arXiv API and writes to the
                     # index, which is no business of a reload or a prefetch.
@@ -797,6 +905,9 @@ def make_handler(index: ResidentIndex, updater: Updater):
                                    {"error": "An update is already running."},
                                    409)
                         return
+                    # A manual run resets the clock too, so the scheduler does
+                    # not follow it with one of its own minutes later.
+                    index.note_run(time.time())
                     self._json(updater.snapshot())
                     return
                 self._send(b"not found", "text/plain", 404)
@@ -870,6 +981,10 @@ def make_handler(index: ResidentIndex, updater: Updater):
                 # only source of truth about whether one is in flight, so a
                 # reloaded page asks here rather than assuming it is idle.
                 self._json(updater.snapshot())
+                return
+
+            if parsed.path == "/api/schedule":
+                self._json(scheduler.status())
                 return
 
             if parsed.path == "/api/profile":
@@ -1054,9 +1169,18 @@ def serve(port: int = 8000, host: str = "127.0.0.1", open_browser: bool = True):
     print(f"{stats['embedded']:,} papers resident ({size:,.0f} MB in {where})"
           + (f", {stats['pending']:,} still embedding" if stats["pending"] else ""))
 
-    server = GracefulHTTPServer((host, port), make_handler(index, Updater()))
+    updater = Updater()
+    scheduler = Scheduler(index, updater)
+    server = GracefulHTTPServer((host, port),
+                                make_handler(index, updater, scheduler))
     url = f"http://{host}:{port}/"
+    setting = index.schedule()
+    if setting["mode"] == "interval":
+        print(f"Automatic updates: every {setting['hours']:g}h")
+    elif setting["mode"] == "daily":
+        print(f"Automatic updates: daily at {setting['at']}")
     print(f"\n  {url}\n\nCtrl-C (or SIGTERM) to stop.")
+    scheduler.start()
     if open_browser:
         threading.Timer(0.5, lambda: webbrowser.open(url)).start()
 
@@ -1085,6 +1209,7 @@ def serve(port: int = 8000, host: str = "127.0.0.1", open_browser: bool = True):
     except KeyboardInterrupt:
         print()
 
+    scheduler.stop()
     cut_short = server.drain()
     server.server_close()
     print(f"Stopped, {cut_short} request(s) cut short."
@@ -1158,28 +1283,28 @@ button.ghost:hover:not(:disabled) { background: var(--accent-soft); }
 .acts-bar button.primary {
   color: #fff; background: var(--accent); border-color: var(--accent);
 }
-#profile {
+#settings {
   display: grid; gap: 14px 22px; grid-template-columns: 1fr 1fr;
   padding: 4px 0 14px;
 }
 /* An author `display` beats the UA rule for [hidden], so the panel needs to be
    told explicitly to stay shut. */
-#profile[hidden] { display: none; }
-@media (max-width: 720px) { #profile { grid-template-columns: 1fr; } }
-#profile label { display: flex; flex-direction: column; gap: 5px;
+#settings[hidden] { display: none; }
+@media (max-width: 720px) { #settings { grid-template-columns: 1fr; } }
+#settings label { display: flex; flex-direction: column; gap: 5px;
                  font-size: 13px; color: var(--muted); }
-#profile label b { font-weight: 600; color: var(--ink); font-size: 14px; }
-#profile textarea {
+#settings label b { font-weight: 600; color: var(--ink); font-size: 14px; }
+#settings textarea {
   font: inherit; font-size: 14px; line-height: 1.5; padding: 9px 11px;
   border: 1px solid var(--line); border-radius: 7px; background: var(--bg);
   color: var(--ink); resize: vertical; min-height: 116px;
 }
-#profile textarea:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+#settings textarea:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
 .pbar { grid-column: 1 / -1; display: flex; gap: 12px; align-items: center;
         font-size: 13px; color: var(--muted); }
 .pbar .bad { color: var(--warn); }
 /* The interests side is a list of rows rather than one field, so it is a
-   plain container: #profile label lays its children out in a column, which is
+   plain container: #settings label lays its children out in a column, which is
    right for a captioned textarea and wrong for a weight beside its text. */
 .pfield { display: flex; flex-direction: column; gap: 5px;
           font-size: 13px; color: var(--muted); }
@@ -1194,8 +1319,8 @@ button.ghost:hover:not(:disabled) { background: var(--accent-soft); }
   color: var(--ink); text-align: center;
 }
 /* Overrides the tall single-field default; a description is a line or two.
-   Needs the id to outrank `#profile textarea`, which sets min-height. */
-#profile .interest textarea {
+   Needs the id to outrank `#settings textarea`, which sets min-height. */
+#settings .interest textarea {
   flex: 1 1 auto; min-height: 0; height: 58px; padding: 7px 10px;
 }
 .interest .drop {
@@ -1205,11 +1330,33 @@ button.ghost:hover:not(:disabled) { background: var(--accent-soft); }
 }
 .interest .drop:hover { background: var(--accent-soft); color: var(--ink); }
 #p-add { align-self: flex-start; margin-top: 2px; }
-#profile .blendrow {
+#settings .blendrow {
   flex-direction: row; align-items: center; gap: 9px; margin-top: 6px;
 }
 .blendrow input[type=range] { flex: 0 1 150px; accent-color: var(--accent); }
 .blendrow output { color: var(--ink); font-variant-numeric: tabular-nums; }
+/* The one control that opens the panel. Square, so the glyph sits centred
+   rather than being letter-spaced like a word. */
+button.cog { font-size: 16px; line-height: 1; padding: 6px 9px; }
+button.cog[aria-expanded="true"] {
+  background: var(--accent-soft); color: var(--ink);
+}
+/* Updates span the panel's full width, under both profile columns. */
+.sfield {
+  grid-column: 1 / -1; display: flex; flex-direction: column; gap: 5px;
+  padding-top: 12px; border-top: 1px solid var(--line);
+  font-size: 13px; color: var(--muted);
+}
+.sfield b { font-weight: 600; color: var(--ink); font-size: 14px; }
+.urow { display: flex; gap: 9px; align-items: center; flex-wrap: wrap;
+        padding-top: 3px; }
+.urow select, .urow input[type=number], .urow input[type=time] {
+  font: inherit; font-size: 14px; padding: 5px 7px; border: 1px solid var(--line);
+  border-radius: 6px; background: var(--bg); color: var(--ink);
+}
+.urow input[type=number] { width: 66px; text-align: center; }
+#s-every[hidden], #s-at[hidden] { display: none; }
+#s-next { color: var(--muted); }
 .opts {
   display: flex; gap: 16px; align-items: center; flex-wrap: wrap;
   padding-bottom: 12px; font-size: 14px; color: var(--muted);
@@ -1326,12 +1473,11 @@ mark { background: var(--accent-soft); color: inherit; }
     <button type="button" id="byinterest" class="ghost primary"
             title="The date range above, ordered by closeness to your research interests">Rank by my interests</button>
     <span class="grow"></span>
-    <button type="button" id="editprofile" class="ghost"
-            title="Who you follow, and what you work on">Profile</button>
-    <button type="button" id="fetch" class="ghost"
-            title="Walk the arXiv API back to where the last run stopped, then embed whatever is new">Fetch new papers</button>
+    <button type="button" id="cog" class="ghost cog" aria-controls="settings"
+            aria-expanded="false"
+            title="Settings — who you follow, what you work on, and when the index tops itself up">⚙</button>
   </div>
-  <div id="profile" hidden>
+  <div id="settings" hidden>
     <label><b>Followed authors</b> one per line; a line with several names,
       like <code>Hardy, Littlewood</code>, means their joint papers
       <textarea id="p-authors" rows="6" spellcheck="false"
@@ -1357,6 +1503,27 @@ counts in full, which favours papers near the middle of all of them.">
       <button type="button" id="p-save">Save</button>
       <button type="button" id="p-cancel" class="ghost">Cancel</button>
       <span id="p-note"></span>
+    </div>
+    <div class="sfield">
+      <b>Automatic updates</b>
+      <span>the same top-up as the button, on a clock, for as long as this
+        server is running. Times are this machine's local time. A missed run
+        is caught up rather than skipped.</span>
+      <div class="urow">
+        <select id="s-mode">
+          <option value="off">Off</option>
+          <option value="interval">Every</option>
+          <option value="daily">Daily at</option>
+        </select>
+        <span id="s-every" hidden>
+          <input type="number" id="s-hours" min="1" max="168" step="1"> hours
+        </span>
+        <input type="time" id="s-at" hidden>
+        <span id="s-next"></span>
+        <span class="grow"></span>
+        <button type="button" id="fetch" class="ghost"
+                title="Walk the arXiv API back to where the last run stopped, then embed whatever is new">Fetch new papers</button>
+      </div>
     </div>
   </div>
   <div id="update" hidden></div>
@@ -1612,7 +1779,7 @@ $("#showscores").onchange = e => {
    anyway. So the editor is a view of server state -- opening it re-reads,
    Cancel discards by re-reading, and nothing is kept in localStorage. */
 
-const prof = $("#profile"), pnote = $("#p-note");
+const prof = $("#settings"), pnote = $("#p-note");
 let profile = {authors: [], interests: [], blend: 0.35, embedded: 0};
 
 function pnotice(text, bad) {
@@ -1686,11 +1853,21 @@ async function loadProfile() {
   fillProfile();
 }
 
-$("#editprofile").onclick = () => {
-  if (prof.hidden) { loadProfile(); prof.hidden = false; $("#p-authors").focus(); }
-  else prof.hidden = true;
+/* One control opens and shuts the panel. Opening re-reads both halves from
+   the server, so what is on screen is what is stored -- the same rule the
+   profile editor already followed, now covering the schedule too. */
+function showSettings(open) {
+  prof.hidden = !open;
+  $("#cog").setAttribute("aria-expanded", open ? "true" : "false");
+  if (open) { loadProfile(); loadSchedule(); }
+}
+
+$("#cog").onclick = () => {
+  const opening = prof.hidden;
+  showSettings(opening);
+  if (opening) $("#p-authors").focus();
 };
-$("#p-cancel").onclick = () => { prof.hidden = true; fillProfile(); };
+$("#p-cancel").onclick = () => { showSettings(false); fillProfile(); };
 $("#p-add").onclick = () => addInterest({text: "", weight: 1})
                               .querySelector("textarea").focus();
 $("#p-blend").oninput = showBlend;
@@ -1733,6 +1910,73 @@ $("#p-save").onclick = async () => {
 };
 
 loadProfile();
+
+/* --- Automatic updates -----------------------------------------------------
+
+   Three controls for one setting, so they are saved on change rather than
+   behind the profile's Save button: a switch that needs a separate confirming
+   click is a switch people believe they have already set. The server is the
+   one that decides what a setting means, so every save re-renders from the
+   response rather than from what was typed. */
+
+let schedule = {mode: "off", hours: 6, at: "07:00", next_run: null};
+
+function whenText(t) {
+  if (t === null || t === undefined) return "";
+  const d = new Date(t * 1000), now = new Date();
+  const hhmm = d.toLocaleTimeString([], {hour: "2-digit", minute: "2-digit"});
+  if (t * 1000 <= Date.now()) return "· due now";
+  const sameDay = d.toDateString() === now.toDateString();
+  const tomorrow = new Date(now.getTime() + 86400000).toDateString()
+                     === d.toDateString();
+  return "· next " + (sameDay ? hhmm
+    : tomorrow ? "tomorrow " + hhmm
+    : d.toLocaleDateString([], {month: "short", day: "numeric"}) + " " + hhmm);
+}
+
+function fillSchedule() {
+  $("#s-mode").value = schedule.mode;
+  $("#s-hours").value = schedule.hours;
+  $("#s-at").value = schedule.at;
+  $("#s-every").hidden = schedule.mode !== "interval";
+  $("#s-at").hidden = schedule.mode !== "daily";
+  $("#s-next").textContent =
+    schedule.mode === "off" ? "" : whenText(schedule.next_run);
+}
+
+async function loadSchedule() {
+  try {
+    schedule = await (await fetch("/api/schedule")).json();
+  } catch (e) { /* leave the defaults; saving will report the real error */ }
+  fillSchedule();
+}
+
+async function saveSchedule() {
+  // Render the new mode at once, so the hours/time control appears under the
+  // pointer rather than after a round trip.
+  schedule = {mode: $("#s-mode").value, hours: $("#s-hours").value,
+              at: $("#s-at").value, next_run: schedule.next_run};
+  fillSchedule();
+  try {
+    const r = await fetch("/api/schedule", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({mode: $("#s-mode").value,
+                            hours: $("#s-hours").value,
+                            at: $("#s-at").value}),
+    });
+    schedule = await r.json();
+    fillSchedule();
+  } catch (e) {
+    $("#s-next").textContent = "· could not save: " + e.message;
+  }
+}
+
+$("#s-mode").onchange = saveSchedule;
+$("#s-hours").onchange = saveSchedule;
+$("#s-at").onchange = saveSchedule;
+
+loadSchedule();
 
 /* The window both buttons act on. Both bounds are optional and neither is
    ever filled in on the reader's behalf: these buttons take the dates exactly
@@ -1877,6 +2121,8 @@ function updateState(s) {
     updTimer = null;
     // The header counts were read once at load; a finished run has moved them.
     refreshStats();
+    // And a run that just finished is the one the next one is timed from.
+    loadSchedule();
   }
 }
 

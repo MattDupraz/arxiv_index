@@ -103,10 +103,13 @@ index, plus the 5.5 GB snapshot while it exists.
 
 The web UI has a search box, an author filter, category checkboxes, a date
 range, expandable abstracts, links to the abstract and PDF, a **BibLaTeX**
-button, **Similar papers** on every result, a **Fetch new papers** button that
-runs the same top-up as `update` without leaving the page, and a
-[reading profile](#your-profile) driving two more buttons. LaTeX in titles and abstracts is
-rendered with a vendored copy of KaTeX, so the whole thing works offline.
+button, **Similar papers** on every result, and a [reading
+profile](#your-profile) driving two more buttons. A cog at the right of the
+button row opens [settings](#settings-the-cog): the profile, a **Fetch new
+papers** button that runs the same top-up as `update` without leaving the page,
+and [when to run that automatically](#automatic-updates). LaTeX in titles and
+abstracts is rendered with a vendored copy of KaTeX, so the whole thing works
+offline.
 
 ```bash
 python3 -m arxiv_index search "toric degenerations of flag varieties"
@@ -137,10 +140,22 @@ logit and the cosine it started from, since the two are on unrelated scales.
 in for the query. Reranking it costs about a second against 8 ms for the plain
 vector lookup, so it is worth leaving off when skimming.
 
+### Settings: the cog
+
+Everything that is configuration rather than a search lives behind the cog at
+the right of the button row — your profile, when the index tops itself up, and
+the **Fetch new papers** button. It is shut by default and nothing in it is
+kept in the browser: opening it re-reads the server, so what is on screen is
+what is stored.
+
+The profile has an explicit **Save** because it is prose being embedded.
+Everything under **Automatic updates** saves the moment you change it — a
+switch that needs a second confirming click is a switch people believe they
+have already set.
+
 ### Your profile
 
-**Profile** opens an editor for two fields that describe *you* rather than a
-search:
+The profile is two fields that describe *you* rather than a search:
 
 | | |
 |---|---|
@@ -241,12 +256,50 @@ metadata and covers every paper in the database, embedded or not.
 python3 -m arxiv_index update
 ```
 
-or the **Fetch new papers** button in the web UI, which runs exactly this.
+or the **Fetch new papers** button under the cog in the web UI, which runs
+exactly this.
 
 Walks the arXiv API back from the newest paper until it reaches the stored
 cursor, embeds what is new, advances the cursor. Papers whose title or abstract
 changed are re-embedded; papers that merely gained a DOI are not. The Kaggle
 snapshot is not involved, and can be deleted after the initial build.
+
+### Automatic updates
+
+An index goes stale behind a server left running for a week, which is the whole
+reason the button exists. Under the cog, **Automatic updates** presses it on a
+clock instead, for as long as `serve` is up:
+
+| | |
+|---|---|
+| **Off** | the default — nothing runs unless you press the button |
+| **Every N hours** | measured from the end of the last run, 1 to 168 |
+| **Daily at HH:MM** | a wall-clock time, in the server machine's **local** time |
+
+Local time rather than UTC on purpose: someone asking for 07:00 means 07:00
+where they are, and arXiv's own announcements go out at a fixed New York time
+rather than anything you would want to convert by hand.
+
+**A missed run is caught up, not skipped.** A daily 07:00 run on a machine that
+was asleep until 09:00 fires at 09:00, because the useful reading of "daily at
+07:00" is "once a day, in the morning" — not "only ever at exactly 07:00". The
+same goes for switching the setting on at all: if a slot has already passed and
+nothing has run since, the first run happens within the minute.
+
+Manual runs count as runs. Pressing **Fetch new papers** resets the clock, so
+the scheduler does not follow you with a second fetch minutes later, and that
+record is stored in the index rather than in memory — a restart does not
+re-trigger a run that already happened.
+
+Only one runs at a time. If a long backlog is still going when the next slot
+comes round, that slot is passed over rather than queued, and the check simply
+asks again on its next tick.
+
+The scheduler is a daemon thread that wakes every 30 seconds and re-reads the
+setting, so a change in the UI takes effect within the tick rather than at the
+next restart. The whole of the "when" is pure functions in `schedule.py` over
+the setting and two timestamps, which is why the awkward cases above can be
+checked directly instead of by waiting around for a clock.
 
 ```cron
 0 7 * * 1  cd /path/to/arXiv_index && python3 -m arxiv_index update >> update.log 2>&1
@@ -315,5 +368,6 @@ what the server holds in memory, and what was tried and abandoned — is in
 | `textnorm.py` | LaTeX author names, folded for matching |
 | `cite.py` | biblatex entries |
 | `profile.py` | followed authors + weighted interests, each with its own embedding |
+| `schedule.py` | when the server tops itself up |
 | `web.py` | local web UI (stdlib `http.server`) |
 | `__main__.py` | CLI |
