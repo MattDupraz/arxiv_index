@@ -31,8 +31,8 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 import numpy as np
 
-from . import (cite, config, rerank as rerank_mod, search as search_mod,
-               store, textnorm, update as update_mod)
+from . import (cite, config, profile as profile_mod, rerank as rerank_mod,
+               search as search_mod, store, textnorm, update as update_mod)
 
 # Vendored KaTeX (js, css, woff2 subset). Kept local rather than pulled from a
 # CDN so the UI still works offline and does not phone home.
@@ -219,20 +219,13 @@ class ResidentIndex:
             "categories": list(config.CATEGORIES),
         }
 
-    def query(self, text, k=20, categories=None, since=None, exclude=None,
-              author=None, rerank=False):
-        self.refresh_if_stale()
-        if not self.ids:
-            return [], 0.0, None
+    def _mask(self, categories=None, since=None, until=None, author=None):
+        """Boolean mask over the matrix rows, or None when nothing filters.
 
-        started = time.monotonic()
-
-        if not text:
-            # No query to be similar to, so this is a metadata listing and has
-            # no business consulting the vectors at all.
-            return (self.browse(k, categories, since, author),
-                    time.monotonic() - started, None)
-
+        This indexes the *matrix*, so it is built from `dates`, `cat_masks` and
+        `authors` -- the embedded rows, in row order -- and never from the
+        metadata tables, which are a different length and a different order.
+        """
         keep = None
         if categories:
             keep = np.zeros(len(self.ids), dtype=bool)
@@ -243,12 +236,32 @@ class ResidentIndex:
         if since:
             recent = self.dates >= since
             keep = recent if keep is None else (keep & recent)
+        if until:
+            earlier = self.dates <= until
+            keep = earlier if keep is None else (keep & earlier)
         terms = textnorm.fold_terms(author)
         if terms:
             by = np.fromiter(
                 (textnorm.matches_terms(a, terms) for a in self.authors),
                 dtype=bool, count=len(self.authors))
             keep = by if keep is None else (keep & by)
+        return keep
+
+    def query(self, text, k=20, categories=None, since=None, exclude=None,
+              author=None, rerank=False, until=None):
+        self.refresh_if_stale()
+        if not self.ids:
+            return [], 0.0, None
+
+        started = time.monotonic()
+
+        if not text:
+            # No query to be similar to, so this is a metadata listing and has
+            # no business consulting the vectors at all.
+            return (self.browse(k, categories, since, author, until),
+                    time.monotonic() - started, None)
+
+        keep = self._mask(categories, since, until, author)
 
         vector = search_mod.embed_query_normalised(text)
         scores = self.score(vector)
@@ -284,24 +297,50 @@ class ResidentIndex:
                 return results[:k], time.monotonic() - started, str(exc)
         return results[:k], time.monotonic() - started, None
 
-    def browse(self, k, categories=None, since=None, author=None):
-        """Newest-first listing by metadata alone, across the whole corpus.
+    def _matching_rows(self, categories=None, since=None, until=None,
+                       match_author=None):
+        """Indices into the metadata tables, newest first, passing the filters.
 
-        Covers papers that have not been embedded yet, which matters during a
-        build and for anything the embedder has not caught up with. Rows are
-        already date-sorted, so this stops as soon as it has k of them.
+        Covers papers with no vector yet, which matters during a build and for
+        anything the embedder has not caught up with.
+
+        The rows are held in update_date order, so a `since` bound stops the
+        scan at the first row older than it instead of walking the rest of the
+        corpus. That is what lets "everything by these authors in the last
+        week" cost a few hundred comparisons rather than 146,000 -- and rows
+        with no date at all sort last, where the same break discards them,
+        which is right: an undated paper cannot be shown to fall in a window.
+
+        `match_author` is a predicate on the folded author string rather than a
+        term list, because the callers disagree about what several names mean:
+        the author box ANDs them, a follow list unions them.
         """
-        terms = textnorm.fold_terms(author)
         wanted = set(categories or ())
-        chosen = []
-        for i, paper_id in enumerate(self.meta_ids):
-            if since and self.meta_dates[i] < since:
+        for i, date in enumerate(self.meta_dates):
+            if since and date < since:
+                break
+            if until and date > until:
                 continue
             if wanted and not (wanted & self.meta_cats[i]):
                 continue
-            if terms and not textnorm.matches_terms(self.meta_authors[i], terms):
+            if match_author and not match_author(self.meta_authors[i]):
                 continue
-            chosen.append(paper_id)
+            yield i
+
+    @staticmethod
+    def _all_terms(author):
+        """Predicate for the author box: every term must appear."""
+        terms = textnorm.fold_terms(author)
+        if not terms:
+            return None
+        return lambda folded: textnorm.matches_terms(folded, terms)
+
+    def browse(self, k, categories=None, since=None, author=None, until=None):
+        """Newest-first listing by metadata alone, across the whole corpus."""
+        chosen = []
+        for i in self._matching_rows(categories, since, until,
+                                     self._all_terms(author)):
+            chosen.append(self.meta_ids[i])
             if len(chosen) >= k:
                 break
         if not chosen:
@@ -311,24 +350,104 @@ class ResidentIndex:
         # number that would mean nothing.
         return [meta[i] | {"score": None} for i in chosen]
 
-    def count_matching(self, categories=None, since=None, author=None) -> int:
-        """How many papers match these filters, embedding or not.
+    def count_matching(self, categories=None, since=None, author=None,
+                       until=None) -> int:
+        """How many papers match these filters, embedded or not.
 
         Used to explain an empty relevance search: during a build the filters
         may well select papers that simply have no vector yet.
         """
-        terms = textnorm.fold_terms(author)
-        wanted = set(categories or ())
-        total = 0
-        for i in range(len(self.meta_ids)):
-            if since and self.meta_dates[i] < since:
-                continue
-            if wanted and not (wanted & self.meta_cats[i]):
-                continue
-            if terms and not textnorm.matches_terms(self.meta_authors[i], terms):
-                continue
+        return sum(1 for _ in self._matching_rows(
+            categories, since, until, self._all_terms(author)))
+
+    def followed(self, authors, k=500, categories=None, since=None,
+                 until=None):
+        """Newest-first listing of papers by *any* of `authors` in the window.
+
+        The union is the point, and it is where this parts company with the
+        author box: that ANDs its names, because "Hardy, Littlewood" asks for
+        their joint work. A follow list is the other thing -- several people
+        whose papers are each worth seeing -- so entries are OR-ed. Within one
+        entry the AND survives, so a single line reading "Hardy, Littlewood"
+        still means the two of them together.
+
+        Returns (results, total). The cap is a display limit, and a listing
+        that was truncated has to be able to say so rather than look complete.
+        """
+        self.refresh_if_stale()
+        groups = [terms for terms in
+                  (textnorm.fold_terms(name) for name in authors) if terms]
+        if not groups:
+            return [], 0
+
+        def match(folded):
+            return any(textnorm.matches_terms(folded, terms)
+                       for terms in groups)
+
+        chosen, total = [], 0
+        for i in self._matching_rows(categories, since, until, match):
             total += 1
-        return total
+            if len(chosen) < k:
+                chosen.append(self.meta_ids[i])
+        if not chosen:
+            return [], 0
+        meta = self._meta(chosen)
+        return [meta[i] | {"score": None} for i in chosen], total
+
+    def ranked(self, vector, k=20, categories=None, since=None, until=None):
+        """The window's papers ordered by cosine against the interests vector.
+
+        Vectors only, deliberately. The cross-encoder scores a *query* against
+        a document, and a standing description of what someone works on is not
+        a query; it would also bound the listing at RERANK_CANDIDATES, capping
+        something whose whole job is to cover a window.
+
+        Only embedded papers can appear -- ranking needs a vector -- so the
+        caller is left to say how much of the window is still waiting.
+        """
+        self.refresh_if_stale()
+        if vector is None or not self.ids:
+            return [], 0.0
+        started = time.monotonic()
+
+        keep = self._mask(categories, since, until)
+        scores = self.score(vector)
+        if keep is not None:
+            if not keep.any():
+                return [], time.monotonic() - started
+            scores = np.where(keep, scores, -2.0)
+
+        want = min(max(k, 1), len(self.ids))
+        top = np.argpartition(-scores, want - 1)[:want]
+        top = top[np.argsort(-scores[top])]
+        chosen = [self.ids[i] for i in top if scores[i] > -2.0]
+        if not chosen:
+            return [], time.monotonic() - started
+        by_id = {self.ids[i]: float(scores[i]) for i in top}
+        meta = self._meta(chosen)
+        return ([meta[i] | {"score": by_id[i]} for i in chosen],
+                time.monotonic() - started)
+
+    # --- The reader's profile ---------------------------------------------
+    # Thin wrappers so handlers never touch the shared connection directly.
+    # save_profile hands the lock down rather than taking it: the embedding
+    # call inside must not run with it held.
+
+    def profile(self) -> dict:
+        with self._db_lock:
+            return profile_mod.load(self.db)
+
+    def save_profile(self, authors, interests):
+        return profile_mod.save(self.db, authors, interests,
+                                lock=self._db_lock)
+
+    def interests_vector(self):
+        with self._db_lock:
+            return profile_mod.vector(self.db)
+
+    def newest_date(self) -> str:
+        """The most recent update_date held. The rows are date-sorted."""
+        return self.meta_dates[0] if self.meta_dates else ""
 
     def _meta(self, ids) -> dict:
         placeholders = ",".join("?" * len(ids))
@@ -510,6 +629,9 @@ class Updater:
         return payload
 
 
+# A profile is two short text fields; anything near this is a mistake.
+MAX_BODY = 256 * 1024
+
 GRACE_PERIOD = 10.0     # seconds to let in-flight requests finish on shutdown
 
 
@@ -605,12 +727,50 @@ def make_handler(index: ResidentIndex, updater: Updater):
         def do_POST(self):
             self.server.request_started()
             try:
-                # Drain the body even though nothing here takes one: leaving it
-                # in the socket would desynchronise the keep-alive connection.
-                length = int(self.headers.get("Content-Length") or 0)
-                if length:
-                    self.rfile.read(length)
-                if urlparse(self.path).path == "/api/update":
+                # The body is always read, even where it is not wanted:
+                # leaving it in the socket desynchronises the keep-alive
+                # connection. Capped so a stray upload cannot be buffered whole.
+                try:
+                    length = int(self.headers.get("Content-Length") or 0)
+                except ValueError:
+                    length = 0
+                if length > MAX_BODY:
+                    self._json({"error": "request body too large"}, 413)
+                    return
+                raw = self.rfile.read(length) if length else b""
+                body = None
+                if raw:
+                    try:
+                        body = json.loads(raw)
+                    except ValueError:
+                        body = None
+                if body is not None and not isinstance(body, dict):
+                    body = None
+                path = urlparse(self.path).path
+                if path == "/api/profile":
+                    if body is None:
+                        self._json({"error": "expected a JSON body"}, 400)
+                        return
+                    authors = body.get("authors", [])
+                    interests = body.get("interests", "")
+                    if (not isinstance(authors, list)
+                            or not isinstance(interests, str)):
+                        self._json({"error": "authors must be a list of "
+                                             "strings and interests a string"},
+                                   400)
+                        return
+                    saved, error = index.save_profile(authors, interests)
+                    if error:
+                        # The text is stored either way; only the embedding
+                        # failed, so this is a warning on a successful save
+                        # rather than a failed request.
+                        saved = saved | {
+                            "warning": f"Interests saved, but embedding them "
+                                       f"failed: {error}"}
+                    self._json(saved)
+                    return
+
+                if path == "/api/update":
                     # POST, not GET: this walks the arXiv API and writes to the
                     # index, which is no business of a reload or a prefetch.
                     if not updater.start():
@@ -623,6 +783,45 @@ def make_handler(index: ResidentIndex, updater: Updater):
                 self._send(b"not found", "text/plain", 404)
             finally:
                 self.server.request_finished()
+
+        def _stale_hint(self, since):
+            """Why a window came back empty, when the reason is the index.
+
+            A range that starts after the newest paper held cannot match
+            anything, and "No matches" reads as "nothing was posted" rather
+            than "this index stopped three weeks ago" -- which is the common
+            case for the default last-7-days window on an index that has not
+            been updated in a while.
+            """
+            newest = index.newest_date()
+            if since and newest and since > newest:
+                return (f"The index holds nothing newer than {newest}. "
+                        f"Fetch new papers to bring it up to date.")
+            return None
+
+        def _window(self, params, one):
+            """(categories, since, until, k) for the two listing endpoints.
+
+            Returns None after answering with a 400, so the caller just stops.
+            """
+            cats = [c for c in params.get("cat", [])
+                    if c in config.CATEGORIES]
+            since = one("since") or None
+            until = one("until") or None
+            for label, value in (("since", since), ("until", until)):
+                if value and not _valid_date(value):
+                    self._json({"error": f"bad {label} date: {value}"}, 400)
+                    return None
+            if since and until and since > until:
+                self._json({"error": f"{since} is after {until}"}, 400)
+                return None
+            try:
+                # Generous, because listing a prolific author's whole output
+                # is a legitimate request (Sturmfels has 217).
+                k = max(1, min(500, int(one("k", "20"))))
+            except ValueError:
+                k = 20
+            return cats, since, until, k
 
         def _route(self):
             parsed = urlparse(self.path)
@@ -654,25 +853,84 @@ def make_handler(index: ResidentIndex, updater: Updater):
                 self._json(updater.snapshot())
                 return
 
+            if parsed.path == "/api/profile":
+                self._json(index.profile())
+                return
+
+            if parsed.path == "/api/followed":
+                window = self._window(params, one)
+                if window is None:
+                    return
+                cats, since, until, _ = window
+                authors = index.profile()["authors"]
+                if not authors:
+                    self._json({"error": "No followed authors yet. Add some "
+                                         "under Profile."}, 400)
+                    return
+                started = time.monotonic()
+                # Everything in the window, not the page's result count: the
+                # question is "what did these people post", which a top-20
+                # would answer wrongly by dropping the rest without saying so.
+                results, total = index.followed(
+                    authors, k=500, categories=cats, since=since, until=until)
+                payload = {"results": results,
+                           "ms": round((time.monotonic() - started) * 1000),
+                           "ranked": "date", "total": total,
+                           "authors": len(authors)}
+                if not results:
+                    payload["hint"] = self._stale_hint(since) or (
+                        f"No papers by your {len(authors)} followed author(s) "
+                        f"in this range.")
+                self._json(payload)
+                return
+
+            if parsed.path == "/api/interests":
+                window = self._window(params, one)
+                if window is None:
+                    return
+                cats, since, until, k = window
+                profile = index.profile()
+                if not profile["interests"]:
+                    self._json({"error": "No research interests yet. Describe "
+                                         "them under Profile."}, 400)
+                    return
+                vector = index.interests_vector()
+                if vector is None:
+                    self._json({"error": "Your interests have not been "
+                                         "embedded yet -- save them again "
+                                         "once Ollama is reachable."}, 409)
+                    return
+                results, elapsed = index.ranked(
+                    vector, k, categories=cats, since=since, until=until)
+                payload = {"results": results, "ms": round(elapsed * 1000),
+                           "ranked": "relevance", "reranked": False}
+                if not results:
+                    # Same trap as an empty relevance search: the window may be
+                    # full of papers that simply have no vector to rank yet.
+                    waiting = index.count_matching(cats, since, until=until)
+                    if waiting:
+                        payload["hint"] = (
+                            f"{waiting:,} paper(s) fall in this range but are "
+                            "not embedded yet, so they cannot be ranked. "
+                            "Fetch new papers, or list them by date instead."
+                        )
+                    else:
+                        payload["hint"] = self._stale_hint(since) or (
+                            "Nothing in this range.")
+                self._json(payload)
+                return
+
             if parsed.path == "/api/search":
                 query = (one("q") or "").strip()
                 author = (one("author") or "").strip()
-                try:
-                    # Generous, because listing a prolific author's whole
-                    # output is a legitimate request (Sturmfels has 217).
-                    k = max(1, min(500, int(one("k", "20"))))
-                except ValueError:
-                    k = 20
-                cats = [c for c in params.get("cat", [])
-                        if c in config.CATEGORIES]
-                since = one("since") or None
-                if since and not _valid_date(since):
-                    self._json({"error": f"bad date: {since}"}, 400)
+                window = self._window(params, one)
+                if window is None:
                     return
+                cats, since, until, k = window
                 # Any single criterion is a valid search on its own -- an
                 # author, a category or a date each describe a listing. Only a
                 # request with no criteria at all is rejected, matching the CLI.
-                if not (query or author or since or cats):
+                if not (query or author or since or until or cats):
                     self._json(
                         {"error": "give a query, author, category or date"}, 400)
                     return
@@ -680,7 +938,7 @@ def make_handler(index: ResidentIndex, updater: Updater):
                 try:
                     results, elapsed, warning = index.query(
                         query, k, cats, since, author=author or None,
-                        rerank=rerank and bool(query))
+                        rerank=rerank and bool(query), until=until)
                 except Exception as exc:  # surfaced in the UI, not swallowed
                     self._json({"error": str(exc)}, 500)
                     return
@@ -693,7 +951,8 @@ def make_handler(index: ResidentIndex, updater: Updater):
                     # An empty relevance search is confusing while a build is
                     # running: the filters may match plenty of papers that
                     # simply have no vector to rank yet.
-                    waiting = index.count_matching(cats, since, author or None)
+                    waiting = index.count_matching(cats, since, author or None,
+                                                   until=until)
                     if waiting:
                         payload["hint"] = (
                             f"{waiting:,} paper(s) match these filters but are "
@@ -856,6 +1115,32 @@ button.ghost:hover:not(:disabled) { background: var(--accent-soft); }
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 #update.bad { color: var(--warn); }
+/* The action row: things that run a listing, as against the filters above
+   that describe one. */
+.acts-bar { padding-bottom: 12px; gap: 10px; }
+.acts-bar button.primary {
+  color: #fff; background: var(--accent); border-color: var(--accent);
+}
+#profile {
+  display: grid; gap: 14px 22px; grid-template-columns: 1fr 1fr;
+  padding: 4px 0 14px;
+}
+/* An author `display` beats the UA rule for [hidden], so the panel needs to be
+   told explicitly to stay shut. */
+#profile[hidden] { display: none; }
+@media (max-width: 720px) { #profile { grid-template-columns: 1fr; } }
+#profile label { display: flex; flex-direction: column; gap: 5px;
+                 font-size: 13px; color: var(--muted); }
+#profile label b { font-weight: 600; color: var(--ink); font-size: 14px; }
+#profile textarea {
+  font: inherit; font-size: 14px; line-height: 1.5; padding: 9px 11px;
+  border: 1px solid var(--line); border-radius: 7px; background: var(--bg);
+  color: var(--ink); resize: vertical; min-height: 116px;
+}
+#profile textarea:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+.pbar { grid-column: 1 / -1; display: flex; gap: 12px; align-items: center;
+        font-size: 13px; color: var(--muted); }
+.pbar .bad { color: var(--warn); }
 .opts {
   display: flex; gap: 16px; align-items: center; flex-wrap: wrap;
   padding-bottom: 12px; font-size: 14px; color: var(--muted);
@@ -953,15 +1238,39 @@ mark { background: var(--accent-soft); color: inherit; }
     <label title="Show the relevance logit and cosine for each hit">
       <input type="checkbox" id="showscores"> Scores</label>
     <label>Since <input type="date" id="since"></label>
+    <label>Until <input type="date" id="until"></label>
     <label>Results
       <select id="k">
         <option>10</option><option selected>20</option>
         <option>50</option><option>100</option><option>250</option>
       </select>
     </label>
+  </div>
+  <div class="opts acts-bar">
+    <button type="button" id="followed" class="ghost primary"
+            title="Every paper by a followed author in the date range above">Followed authors</button>
+    <button type="button" id="byinterest" class="ghost primary"
+            title="The date range above, ordered by closeness to your research interests">Rank by my interests</button>
     <span class="grow"></span>
+    <button type="button" id="editprofile" class="ghost"
+            title="Who you follow, and what you work on">Profile</button>
     <button type="button" id="fetch" class="ghost"
             title="Walk the arXiv API back to where the last run stopped, then embed whatever is new">Fetch new papers</button>
+  </div>
+  <div id="profile" hidden>
+    <label><b>Followed authors</b> one per line; a line with several names,
+      like <code>Hardy, Littlewood</code>, means their joint papers
+      <textarea id="p-authors" rows="6" spellcheck="false"
+                placeholder="Emmy Noether&#10;David Hilbert"></textarea></label>
+    <label><b>Research interests</b> a paragraph in your own words — it is
+      embedded and compared against abstracts, so prose beats keywords
+      <textarea id="p-interests" rows="6"
+                placeholder="Toric degenerations of flag varieties, Newton–Okounkov bodies, and the combinatorics of Gröbner bases…"></textarea></label>
+    <div class="pbar">
+      <button type="button" id="p-save">Save</button>
+      <button type="button" id="p-cancel" class="ghost">Cancel</button>
+      <span id="p-note"></span>
+    </div>
   </div>
   <div id="update" hidden></div>
 </div></header>
@@ -1175,7 +1484,9 @@ function render(data, label) {
   // One pass over the whole list. Abstracts are still display:none at this
   // point, which is fine -- KaTeX builds DOM and needs no layout.
   typeset(box);
-  const bits = [`${data.results.length} results in ${data.ms} ms`];
+  const bits = [data.total && data.total > data.results.length
+    ? `${data.results.length} of ${data.total} results in ${data.ms} ms`
+    : `${data.results.length} results in ${data.ms} ms`];
   if (data.reranked) bits.push("cross-encoder reranked");
   if (data.warning) bits.push(data.warning);
   if (label) bits.push(label);
@@ -1208,19 +1519,123 @@ $("#showscores").onchange = e => {
   localStorage.setItem("arxiv-index-scores", e.target.checked ? "1" : "0");
 };
 
+/* ---- The profile, and the two listings built on it ---------------------
+   Both fields live in the index, not in this page: they describe the reader,
+   not the tab, and the interests embedding has to be computed server-side
+   anyway. So the editor is a view of server state -- opening it re-reads,
+   Cancel discards by re-reading, and nothing is kept in localStorage. */
+
+const prof = $("#profile"), pnote = $("#p-note");
+let profile = {authors: [], interests: "", vector: false};
+
+function pnotice(text, bad) {
+  pnote.textContent = text || "";
+  pnote.classList.toggle("bad", !!bad);
+}
+
+function fillProfile() {
+  $("#p-authors").value = profile.authors.join("\n");
+  $("#p-interests").value = profile.interests;
+  pnotice(profile.interests && !profile.vector
+    ? "Interests are saved but not embedded — ranking is unavailable." : "");
+}
+
+async function loadProfile() {
+  try {
+    profile = await (await fetch("/api/profile")).json();
+  } catch (e) { /* leave the defaults; saving will report the real error */ }
+  fillProfile();
+}
+
+$("#editprofile").onclick = () => {
+  if (prof.hidden) { loadProfile(); prof.hidden = false; $("#p-authors").focus(); }
+  else prof.hidden = true;
+};
+$("#p-cancel").onclick = () => { prof.hidden = true; fillProfile(); };
+
+$("#p-save").onclick = async () => {
+  const btn = $("#p-save");
+  btn.disabled = true;
+  pnotice("Saving…");
+  try {
+    const r = await fetch("/api/profile", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({
+        // One author per line. The server trims, drops blanks and
+        // de-duplicates, so this does not have to.
+        authors: $("#p-authors").value.split("\n"),
+        interests: $("#p-interests").value,
+      }),
+    });
+    const data = await r.json();
+    if (data.error) { pnotice("Error: " + data.error, true); return; }
+    profile = data;
+    // Re-render from what came back, so the list shown is the list stored.
+    fillProfile();
+    if (data.warning) pnotice(data.warning, true);
+    else pnotice(`Saved · ${data.authors.length} author(s)`
+                 + (data.vector ? " · interests embedded" : ""));
+  } catch (e) {
+    pnotice("Request failed: " + e.message, true);
+  } finally {
+    btn.disabled = false;
+  }
+};
+
+loadProfile();
+
+/* The window both buttons act on. "Last 7 days" is a default rather than a
+   fixed range: an empty Since is filled in on the way out, so the range that
+   was used is visible in the form afterwards and can then be widened. */
+const DEFAULT_DAYS = 7;
+
+function windowParams() {
+  if (!$("#since").value) {
+    const d = new Date();
+    d.setDate(d.getDate() - DEFAULT_DAYS);
+    // Local date, not toISOString(), which would shift by the UTC offset and
+    // silently move the boundary a day for anyone east or west of it.
+    $("#since").value = [d.getFullYear(),
+                         String(d.getMonth() + 1).padStart(2, "0"),
+                         String(d.getDate()).padStart(2, "0")].join("-");
+  }
+  const p = new URLSearchParams({since: $("#since").value});
+  if ($("#until").value) p.set("until", $("#until").value);
+  document.querySelectorAll(".cat:checked").forEach(c => p.append("cat", c.value));
+  return p;
+}
+
+function rangeLabel() {
+  const a = $("#since").value, b = $("#until").value;
+  return b ? `${a} to ${b}` : `since ${a}`;
+}
+
+$("#followed").onclick = () => {
+  const p = windowParams();
+  run("/api/followed?" + p, "followed authors, " + rangeLabel());
+};
+
+$("#byinterest").onclick = () => {
+  const p = windowParams();
+  p.set("k", $("#k").value);
+  run("/api/interests?" + p, "by your interests, " + rangeLabel());
+};
+
 $("#f").onsubmit = e => {
   e.preventDefault();
   const q = $("#q").value.trim(), author = $("#author").value.trim();
   const cats = [...document.querySelectorAll(".cat:checked")].map(c => c.value);
-  const since = $("#since").value;
+  const since = $("#since").value, until = $("#until").value;
   // Any single criterion is a valid search; only nothing at all is a no-op.
-  if (!q && !author && !since && !cats.length) return;
+  if (!q && !author && !since && !until && !cats.length) return;
   const p = new URLSearchParams({q, k: $("#k").value});
   if (author) p.set("author", author);
   // The control is absent when the server cannot rerank, so ask it that way.
   if (reranking() && q) p.set("rerank", "1");
   document.querySelectorAll(".cat:checked").forEach(c => p.append("cat", c.value));
   if ($("#since").value) p.set("since", $("#since").value);
+  if ($("#until").value) p.set("until", $("#until").value);
   run("/api/search?" + p, author && !q ? "by " + author + ", newest first" : null);
 };
 

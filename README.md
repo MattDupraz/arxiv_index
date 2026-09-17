@@ -101,10 +101,11 @@ index, plus the 5.5 GB snapshot while it exists.
 
 ## Using it
 
-The web UI has a search box, an author filter, category checkboxes, a since-date
-filter, expandable abstracts, links to the abstract and PDF, a **BibLaTeX**
-button, **Similar papers** on every result, and a **Fetch new papers** button
-that runs the same top-up as `update` without leaving the page. LaTeX in titles and abstracts is
+The web UI has a search box, an author filter, category checkboxes, a date
+range, expandable abstracts, links to the abstract and PDF, a **BibLaTeX**
+button, **Similar papers** on every result, a **Fetch new papers** button that
+runs the same top-up as `update` without leaving the page, and a
+[reading profile](#your-profile) driving two more buttons. LaTeX in titles and abstracts is
 rendered with a vendored copy of KaTeX, so the whole thing works offline.
 
 ```bash
@@ -135,6 +136,47 @@ logit and the cosine it started from, since the two are on unrelated scales.
 **Similar papers** works the same way, with the source paper's own text standing
 in for the query. Reranking it costs about a second against 8 ms for the plain
 vector lookup, so it is worth leaving off when skimming.
+
+### Your profile
+
+**Profile** opens an editor for two fields that describe *you* rather than a
+search:
+
+| | |
+|---|---|
+| **Followed authors** | one name per line — people whose papers are worth seeing whatever they are about |
+| **Research interests** | a paragraph in your own words, describing what you work on |
+
+Both live in the index's `meta` table, next to the model name and the update
+cursor, so they are backed up and copied along with `papers.db` and survive a
+restart. Nothing is kept in the browser.
+
+They drive two buttons, both over the **Since**/**Until** range, which defaults
+to the last 7 days — the buttons fill **Since** in when it is empty, so the
+range actually used is visible and can then be widened.
+
+**Followed authors** lists everything those people posted in the range,
+newest-first. Note this is a *union*: several followed authors means papers by
+any of them, which is the opposite of the author box, where several names mean
+papers they wrote **together**. Within one line the author box's reading
+survives, so a line reading `Hardy, Littlewood` still asks for their joint work.
+The listing covers papers that are not embedded yet, and says `12 of 40 results`
+when the range holds more than it shows.
+
+**Rank by my interests** takes the same range and orders it by how close each
+abstract is to your interests paragraph. This is the embedding only — no
+reranking. The cross-encoder scores a *query* against a document, and a standing
+description of what you work on is not a query; it would also cap the listing at
+the 50-paper shortlist, which is wrong for something meant to cover a window.
+Only embedded papers can be ranked, and an empty result says how many are still
+waiting.
+
+The paragraph is embedded once, when you save it, and the vector is stored
+beside it — so ranking a range is one dot product against vectors already in
+memory rather than a round trip to Ollama. If Ollama is unreachable when you
+save, the text is stored anyway and the editor says ranking is unavailable until
+you save again; the old vector is dropped first, so a new paragraph is never
+ranked by the embedding of the previous one.
 
 ### Searching by author
 
@@ -240,5 +282,6 @@ what the server holds in memory, and what was tried and abandoned — is in
 | `rerank.py` | cross-encoder reranking of the shortlist |
 | `textnorm.py` | LaTeX author names, folded for matching |
 | `cite.py` | biblatex entries |
+| `profile.py` | followed authors + interests, and the interests embedding |
 | `web.py` | local web UI (stdlib `http.server`) |
 | `__main__.py` | CLI |
