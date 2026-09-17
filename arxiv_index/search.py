@@ -19,8 +19,15 @@ CHUNK = 32_768
 
 def score_all(matrix, query: np.ndarray) -> np.ndarray:
     """Cosine similarity of `query` against every row. Both sides are already
-    L2-normalised, so the cosine is just a dot product."""
-    scores = np.empty(len(matrix), dtype=np.float32)
+    L2-normalised, so the cosine is just a dot product.
+
+    `query` is either one vector, shape (DIM,), giving one score per row, or a
+    stack of them, shape (DIM, n), giving (rows, n). The stacked form exists so
+    that ranking against several interests still reads the 745 MB matrix once:
+    n separate calls would each pull it through the cache again, and the matrix
+    is far and away the expensive part of this.
+    """
+    scores = np.empty((len(matrix),) + query.shape[1:], dtype=np.float32)
     for start in range(0, len(matrix), CHUNK):
         block = np.asarray(matrix[start:start + CHUNK], dtype=np.float32)
         scores[start:start + len(block)] = block @ query

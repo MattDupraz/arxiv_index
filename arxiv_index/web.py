@@ -394,8 +394,16 @@ class ResidentIndex:
         meta = self._meta(chosen)
         return [meta[i] | {"score": None} for i in chosen], total
 
-    def ranked(self, vector, k=20, categories=None, since=None, until=None):
-        """The window's papers ordered by cosine against the interests vector.
+    def ranked(self, queries, weights, blend, k=20, categories=None,
+               since=None, until=None):
+        """The window's papers ordered by closeness to a set of interests.
+
+        `queries` is a stack of unit interest vectors, `weights` the weight
+        beside each. A paper is scored against every interest, those scores are
+        multiplied by their weights and sorted best-first, and the result is
+        summed under profile.blend_decay -- so the best match counts in full
+        and each further one counts less. `blend` picks how much less: 0 scores
+        a paper by its single best interest, 1 by all of them equally.
 
         Vectors only, deliberately. The cross-encoder scores a *query* against
         a document, and a standing description of what someone works on is not
@@ -406,21 +414,31 @@ class ResidentIndex:
         caller is left to say how much of the window is still waiting.
         """
         self.refresh_if_stale()
-        if vector is None or not self.ids:
+        if queries is None or not len(queries) or not self.ids:
             return [], 0.0
         started = time.monotonic()
 
         keep = self._mask(categories, since, until)
-        scores = self.score(vector)
+        if keep is not None and not keep.any():
+            return [], time.monotonic() - started
+
+        # (papers, interests), filled in a single pass over the matrix.
+        per = np.atleast_2d(self.score(np.ascontiguousarray(queries.T)))
+        if per.shape[0] != len(self.ids):  # a lone interest comes back 1-D
+            per = per.reshape(len(self.ids), -1)
+        per *= np.asarray(weights, dtype=np.float32)
+        per.sort(axis=1)
+        scores = per[:, ::-1] @ profile_mod.blend_decay(blend, per.shape[1])
+
+        # -inf rather than a sentinel below every real score: weights scale
+        # these past [-1, 1], so no finite floor is safe to assume any more.
         if keep is not None:
-            if not keep.any():
-                return [], time.monotonic() - started
-            scores = np.where(keep, scores, -2.0)
+            scores = np.where(keep, scores, -np.inf)
 
         want = min(max(k, 1), len(self.ids))
         top = np.argpartition(-scores, want - 1)[:want]
         top = top[np.argsort(-scores[top])]
-        chosen = [self.ids[i] for i in top if scores[i] > -2.0]
+        chosen = [self.ids[i] for i in top if np.isfinite(scores[i])]
         if not chosen:
             return [], time.monotonic() - started
         by_id = {self.ids[i]: float(scores[i]) for i in top}
@@ -437,13 +455,14 @@ class ResidentIndex:
         with self._db_lock:
             return profile_mod.load(self.db)
 
-    def save_profile(self, authors, interests):
-        return profile_mod.save(self.db, authors, interests,
+    def save_profile(self, authors, interests, blend=None):
+        return profile_mod.save(self.db, authors, interests, blend,
                                 lock=self._db_lock)
 
-    def interests_vector(self):
+    def interests_vectors(self):
+        """(stacked unit vectors, weights), or (None, None) if none rank."""
         with self._db_lock:
-            return profile_mod.vector(self.db)
+            return profile_mod.vectors(self.db)
 
     def newest_date(self) -> str:
         """The most recent update_date held. The rows are date-sorted."""
@@ -752,14 +771,14 @@ def make_handler(index: ResidentIndex, updater: Updater):
                         self._json({"error": "expected a JSON body"}, 400)
                         return
                     authors = body.get("authors", [])
-                    interests = body.get("interests", "")
-                    if (not isinstance(authors, list)
-                            or not isinstance(interests, str)):
-                        self._json({"error": "authors must be a list of "
-                                             "strings and interests a string"},
-                                   400)
+                    interests = body.get("interests", [])
+                    if not isinstance(authors, list) or not isinstance(
+                            interests, list):
+                        self._json({"error": "authors and interests must both "
+                                             "be lists"}, 400)
                         return
-                    saved, error = index.save_profile(authors, interests)
+                    saved, error = index.save_profile(
+                        authors, interests, body.get("blend"))
                     if error:
                         # The text is stored either way; only the embedding
                         # failed, so this is a warning on a successful save
@@ -894,16 +913,24 @@ def make_handler(index: ResidentIndex, updater: Updater):
                     self._json({"error": "No research interests yet. Describe "
                                          "them under Profile."}, 400)
                     return
-                vector = index.interests_vector()
-                if vector is None:
-                    self._json({"error": "Your interests have not been "
-                                         "embedded yet -- save them again "
-                                         "once Ollama is reachable."}, 409)
+                queries, weights = index.interests_vectors()
+                if queries is None:
+                    # Either nothing is embedded yet, or every entry that is
+                    # has been turned off with a zero weight. Both leave
+                    # nothing to rank by, but they are not the same mistake.
+                    self._json({"error": (
+                        "None of your interests can be ranked by: they are "
+                        "all switched off with a weight of 0."
+                        if profile["embedded"] else
+                        "Your interests have not been embedded yet -- save "
+                        "them again once Ollama is reachable.")}, 409)
                     return
                 results, elapsed = index.ranked(
-                    vector, k, categories=cats, since=since, until=until)
+                    queries, weights, profile["blend"], k,
+                    categories=cats, since=since, until=until)
                 payload = {"results": results, "ms": round(elapsed * 1000),
-                           "ranked": "relevance", "reranked": False}
+                           "ranked": "relevance", "reranked": False,
+                           "interests": len(weights)}
                 if not results:
                     # Same trap as an empty relevance search: the window may be
                     # full of papers that simply have no vector to rank yet.
@@ -1151,6 +1178,38 @@ button.ghost:hover:not(:disabled) { background: var(--accent-soft); }
 .pbar { grid-column: 1 / -1; display: flex; gap: 12px; align-items: center;
         font-size: 13px; color: var(--muted); }
 .pbar .bad { color: var(--warn); }
+/* The interests side is a list of rows rather than one field, so it is a
+   plain container: #profile label lays its children out in a column, which is
+   right for a captioned textarea and wrong for a weight beside its text. */
+.pfield { display: flex; flex-direction: column; gap: 5px;
+          font-size: 13px; color: var(--muted); }
+.pfield b { font-weight: 600; color: var(--ink); font-size: 14px; }
+.ihead { display: flex; gap: 8px; font-size: 12px; padding-top: 3px; }
+.ihead span:first-child { width: 64px; flex: none; }
+#p-interests { display: flex; flex-direction: column; gap: 6px; }
+.interest { display: flex; gap: 8px; align-items: stretch; }
+.interest input[type=number] {
+  width: 64px; flex: none; font: inherit; font-size: 14px; padding: 9px 4px;
+  border: 1px solid var(--line); border-radius: 7px; background: var(--bg);
+  color: var(--ink); text-align: center;
+}
+/* Overrides the tall single-field default; a description is a line or two.
+   Needs the id to outrank `#profile textarea`, which sets min-height. */
+#profile .interest textarea {
+  flex: 1 1 auto; min-height: 0; height: 58px; padding: 7px 10px;
+}
+.interest .drop {
+  flex: none; width: 30px; padding: 0; font: inherit; font-size: 17px;
+  line-height: 1; border: 1px solid var(--line); border-radius: 7px;
+  background: none; color: var(--muted); cursor: pointer;
+}
+.interest .drop:hover { background: var(--accent-soft); color: var(--ink); }
+#p-add { align-self: flex-start; margin-top: 2px; }
+#profile .blendrow {
+  flex-direction: row; align-items: center; gap: 9px; margin-top: 6px;
+}
+.blendrow input[type=range] { flex: 0 1 150px; accent-color: var(--accent); }
+.blendrow output { color: var(--ink); font-variant-numeric: tabular-nums; }
 .opts {
   display: flex; gap: 16px; align-items: center; flex-wrap: wrap;
   padding-bottom: 12px; font-size: 14px; color: var(--muted);
@@ -1277,10 +1336,23 @@ mark { background: var(--accent-soft); color: inherit; }
       like <code>Hardy, Littlewood</code>, means their joint papers
       <textarea id="p-authors" rows="6" spellcheck="false"
                 placeholder="Emmy Noether&#10;David Hilbert"></textarea></label>
-    <label><b>Research interests</b> a paragraph in your own words — it is
-      embedded and compared against abstracts, so prose beats keywords
-      <textarea id="p-interests" rows="6"
-                placeholder="Toric degenerations of flag varieties, Newton–Okounkov bodies, and the combinatorics of Gröbner bases…"></textarea></label>
+    <div class="pfield">
+      <b>Research interests</b>
+      <span>one short description per thing you work on — each is embedded and
+        matched separately, so distinct projects stay distinct instead of
+        averaging into one blur. Weight 0 switches an entry off.</span>
+      <div class="ihead"><span>Weight</span><span>Description</span></div>
+      <div id="p-interests"></div>
+      <button type="button" id="p-add" class="ghost">Add interest</button>
+      <label class="blendrow" title="A paper is scored by its best-matching
+interest, plus a diminishing share of every further match. At 0 only the best
+match counts, so a paper squarely on one project wins. At 1 every interest
+counts in full, which favours papers near the middle of all of them.">
+        Reward for matching several
+        <input type="range" id="p-blend" min="0" max="1" step="0.05">
+        <output id="p-blendout"></output>
+      </label>
+    </div>
     <div class="pbar">
       <button type="button" id="p-save">Save</button>
       <button type="button" id="p-cancel" class="ghost">Cancel</button>
@@ -1541,18 +1613,70 @@ $("#showscores").onchange = e => {
    Cancel discards by re-reading, and nothing is kept in localStorage. */
 
 const prof = $("#profile"), pnote = $("#p-note");
-let profile = {authors: [], interests: "", vector: false};
+let profile = {authors: [], interests: [], blend: 0.35, embedded: 0};
 
 function pnotice(text, bad) {
   pnote.textContent = text || "";
   pnote.classList.toggle("bad", !!bad);
 }
 
+/* One editable row per interest. Built rather than written as markup because
+   the text is the reader's and must never be interpolated into HTML. */
+function addInterest(entry) {
+  const row = document.createElement("div");
+  row.className = "interest";
+
+  const weight = document.createElement("input");
+  weight.type = "number";
+  weight.min = "0"; weight.max = "10"; weight.step = "0.5";
+  weight.value = entry.weight;
+  weight.title = "How much this interest counts. 0 switches it off.";
+
+  const text = document.createElement("textarea");
+  text.value = entry.text;
+  text.spellcheck = false;
+  text.placeholder = "Combinatorial K-theory of matroids";
+  // An entry saved without a vector cannot be ranked by, which is worth
+  // seeing on the row itself and not only in the notice.
+  if (entry.text && entry.embedded === false) {
+    text.title = "Saved, but not embedded yet — this one cannot be ranked by.";
+    text.style.borderColor = "var(--warn)";
+  }
+
+  const drop = document.createElement("button");
+  drop.type = "button";
+  drop.className = "drop";
+  drop.textContent = "×";
+  drop.title = "Remove this interest";
+  drop.onclick = () => {
+    row.remove();
+    // Never leave the list with nothing to type into.
+    if (!$("#p-interests").children.length) addInterest({text: "", weight: 1});
+  };
+
+  row.append(weight, text, drop);
+  $("#p-interests").append(row);
+  return row;
+}
+
+function showBlend() {
+  const v = Number($("#p-blend").value);
+  $("#p-blendout").textContent =
+    v <= 0 ? "best match only" : v >= 1 ? "all equally" : v.toFixed(2);
+}
+
 function fillProfile() {
   $("#p-authors").value = profile.authors.join("\n");
-  $("#p-interests").value = profile.interests;
-  pnotice(profile.interests && !profile.vector
-    ? "Interests are saved but not embedded — ranking is unavailable." : "");
+  $("#p-interests").textContent = "";
+  const rows = profile.interests.length
+    ? profile.interests : [{text: "", weight: 1}];
+  rows.forEach(addInterest);
+  $("#p-blend").value = profile.blend;
+  showBlend();
+  const waiting = profile.interests.filter(i => !i.embedded).length;
+  pnotice(waiting
+    ? `${waiting} interest(s) saved but not embedded — those cannot be `
+      + `ranked by.` : "");
 }
 
 async function loadProfile() {
@@ -1567,6 +1691,9 @@ $("#editprofile").onclick = () => {
   else prof.hidden = true;
 };
 $("#p-cancel").onclick = () => { prof.hidden = true; fillProfile(); };
+$("#p-add").onclick = () => addInterest({text: "", weight: 1})
+                              .querySelector("textarea").focus();
+$("#p-blend").oninput = showBlend;
 
 $("#p-save").onclick = async () => {
   const btn = $("#p-save");
@@ -1580,7 +1707,13 @@ $("#p-save").onclick = async () => {
         // One author per line. The server trims, drops blanks and
         // de-duplicates, so this does not have to.
         authors: $("#p-authors").value.split("\n"),
-        interests: $("#p-interests").value,
+        // Likewise for blank rows: posted as typed, cleaned server-side, and
+        // re-rendered below from whatever came back.
+        interests: [...$("#p-interests").children].map(row => ({
+          text: row.querySelector("textarea").value,
+          weight: row.querySelector("input").value,
+        })),
+        blend: $("#p-blend").value,
       }),
     });
     const data = await r.json();
@@ -1589,8 +1722,9 @@ $("#p-save").onclick = async () => {
     // Re-render from what came back, so the list shown is the list stored.
     fillProfile();
     if (data.warning) pnotice(data.warning, true);
-    else pnotice(`Saved · ${data.authors.length} author(s)`
-                 + (data.vector ? " · interests embedded" : ""));
+    else pnotice(`Saved · ${data.authors.length} author(s) · `
+                 + `${data.embedded}/${data.interests.length} interest(s) `
+                 + `embedded`);
   } catch (e) {
     pnotice("Request failed: " + e.message, true);
   } finally {

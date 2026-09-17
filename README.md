@@ -145,7 +145,7 @@ search:
 | | |
 |---|---|
 | **Followed authors** | one name per line — people whose papers are worth seeing whatever they are about |
-| **Research interests** | a paragraph in your own words, describing what you work on |
+| **Research interests** | one short description per thing you work on, each with a weight |
 
 Both live in the index's `meta` table, next to the model name and the update
 cursor, so they are backed up and copied along with `papers.db` and survive a
@@ -165,19 +165,50 @@ The listing covers papers that are not embedded yet, and says `12 of 40 results`
 when the range holds more than it shows.
 
 **Rank by my interests** takes the same range and orders it by how close each
-abstract is to your interests paragraph. This is the embedding only — no
-reranking. The cross-encoder scores a *query* against a document, and a standing
-description of what you work on is not a query; it would also cap the listing at
-the 50-paper shortlist, which is wrong for something meant to cover a window.
-Only embedded papers can be ranked, and an empty result says how many are still
-waiting.
+abstract is to what you work on. This is the embedding only — no reranking. The
+cross-encoder scores a *query* against a document, and a standing description of
+what you work on is not a query; it would also cap the listing at the 50-paper
+shortlist, which is wrong for something meant to cover a window. Only embedded
+papers can be ranked, and an empty result says how many are still waiting.
 
-The paragraph is embedded once, when you save it, and the vector is stored
-beside it — so ranking a range is one dot product against vectors already in
-memory rather than a round trip to Ollama. If Ollama is unreachable when you
-save, the text is stored anyway and the editor says ranking is unavailable until
-you save again; the old vector is dropped first, so a new paragraph is never
-ranked by the embedding of the previous one.
+#### Interests are a list, not a paragraph
+
+Write one short description per project. Each is embedded **separately**, so
+they stay distinct: a single paragraph has to become a single point in the
+space, which lands in the middle of everything you do and is squarely none of
+it.
+
+Each entry carries a **weight** — how much that project counts. `0` switches an
+entry off without deleting it, which is the cheap way to park something you are
+not reading this month.
+
+A paper is scored against every interest. Those scores are multiplied by their
+weights, sorted best-first, and added up with each one after the first counting
+less: the first in full, the second times *b*, the third times *b²*, and so on.
+The **Reward for matching several** slider is *b*, and it spans exactly the two
+rules you might have wanted instead:
+
+| *b* | what it does |
+|---|---|
+| `0` | only the best match counts — a weighted maximum. A paper squarely on one project wins outright. |
+| `0.35` | the default. The best match dominates, but genuinely matching a second project still lifts a paper. |
+| `1` | every match counts in full — a weighted sum, which ranks identically to averaging your interests into one vector. |
+
+The difference is real. On this index, with three interests, `0` puts
+`$K$-rings of wonderful varieties and matroids` first and a paper touching
+several projects sixth; `1` promotes the papers that are vaguely near
+everything, which is the failure mode the list was meant to fix.
+
+Each description is embedded once, when you save it, and its vector is stored in
+the same record — so ranking a range is one pass over the matrix no matter how
+many interests you keep, and editing one entry re-embeds only that entry.
+Changing a weight or the slider embeds nothing at all. If Ollama is unreachable
+when you save, the text is stored anyway and that row is flagged as unrankable
+until you save again; a vector never outlives the wording it came from, so an
+edited description is never ranked by its previous embedding.
+
+An interests paragraph written by an earlier version is read as a single
+weighted entry, embedding and all — nothing to retype, and nothing to re-embed.
 
 ### Searching by author
 
@@ -283,6 +314,6 @@ what the server holds in memory, and what was tried and abandoned — is in
 | `rerank.py` | cross-encoder reranking of the shortlist |
 | `textnorm.py` | LaTeX author names, folded for matching |
 | `cite.py` | biblatex entries |
-| `profile.py` | followed authors + interests, and the interests embedding |
+| `profile.py` | followed authors + weighted interests, each with its own embedding |
 | `web.py` | local web UI (stdlib `http.server`) |
 | `__main__.py` | CLI |
