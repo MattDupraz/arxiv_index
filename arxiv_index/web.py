@@ -880,7 +880,7 @@ def make_handler(index: ResidentIndex, updater: Updater):
                 if not results:
                     payload["hint"] = self._stale_hint(since) or (
                         f"No papers by your {len(authors)} followed author(s) "
-                        f"in this range.")
+                        f"{_scope(since, until)}.")
                 self._json(payload)
                 return
 
@@ -910,13 +910,14 @@ def make_handler(index: ResidentIndex, updater: Updater):
                     waiting = index.count_matching(cats, since, until=until)
                     if waiting:
                         payload["hint"] = (
-                            f"{waiting:,} paper(s) fall in this range but are "
-                            "not embedded yet, so they cannot be ranked. "
-                            "Fetch new papers, or list them by date instead."
+                            f"{waiting:,} paper(s) fall {_scope(since, until)} "
+                            "but are not embedded yet, so they cannot be "
+                            "ranked. Fetch new papers, or list them by date "
+                            "instead."
                         )
                     else:
                         payload["hint"] = self._stale_hint(since) or (
-                            "Nothing in this range.")
+                            f"Nothing {_scope(since, until)}.")
                 self._json(payload)
                 return
 
@@ -996,6 +997,15 @@ def make_handler(index: ResidentIndex, updater: Updater):
             self._send(b"not found", "text/plain", 404)
 
     return Handler
+
+
+def _scope(since, until) -> str:
+    """How to refer to the window in a message, now that it may be unbounded.
+
+    Both date fields empty means the whole index, and "in this range" would
+    then be describing a range the reader never set.
+    """
+    return "in this range" if (since or until) else "anywhere in the index"
 
 
 def _valid_date(text: str) -> bool:
@@ -1151,6 +1161,9 @@ button.ghost:hover:not(:disabled) { background: var(--accent-soft); }
   border-radius: 5px; background: var(--bg); color: var(--ink);
 }
 .opts input[type=text] { width: 150px; }
+/* One flex item holding both date fields: .opts wraps around the pair,
+   never between them. */
+.dates { display: flex; gap: 10px; align-items: center; }
 #status { padding: 14px 0 0; font-size: 14px; color: var(--muted); min-height: 20px; }
 #results { padding: 6px 0 60px; }
 article {
@@ -1237,8 +1250,10 @@ mark { background: var(--accent-soft); color: inherit; }
 <!--RERANK-->
     <label title="Show the relevance logit and cosine for each hit">
       <input type="checkbox" id="showscores"> Scores</label>
-    <label>Since <input type="date" id="since"></label>
-    <label>Until <input type="date" id="until"></label>
+    <span class="dates">
+      <label>Since <input type="date" id="since"></label>
+      <label>Until <input type="date" id="until"></label>
+    </span>
     <label>Results
       <select id="k">
         <option>10</option><option selected>20</option>
@@ -1585,22 +1600,14 @@ $("#p-save").onclick = async () => {
 
 loadProfile();
 
-/* The window both buttons act on. "Last 7 days" is a default rather than a
-   fixed range: an empty Since is filled in on the way out, so the range that
-   was used is visible in the form afterwards and can then be widened. */
-const DEFAULT_DAYS = 7;
-
+/* The window both buttons act on. Both bounds are optional and neither is
+   ever filled in on the reader's behalf: these buttons take the dates exactly
+   as the form has them, the same way Search does, so clicking one cannot move
+   a boundary that was deliberately set or left blank. Two empty fields mean
+   the whole index, which is what an empty date field plainly says. */
 function windowParams() {
-  if (!$("#since").value) {
-    const d = new Date();
-    d.setDate(d.getDate() - DEFAULT_DAYS);
-    // Local date, not toISOString(), which would shift by the UTC offset and
-    // silently move the boundary a day for anyone east or west of it.
-    $("#since").value = [d.getFullYear(),
-                         String(d.getMonth() + 1).padStart(2, "0"),
-                         String(d.getDate()).padStart(2, "0")].join("-");
-  }
-  const p = new URLSearchParams({since: $("#since").value});
+  const p = new URLSearchParams();
+  if ($("#since").value) p.set("since", $("#since").value);
   if ($("#until").value) p.set("until", $("#until").value);
   document.querySelectorAll(".cat:checked").forEach(c => p.append("cat", c.value));
   return p;
@@ -1608,7 +1615,10 @@ function windowParams() {
 
 function rangeLabel() {
   const a = $("#since").value, b = $("#until").value;
-  return b ? `${a} to ${b}` : `since ${a}`;
+  if (a && b) return `${a} to ${b}`;
+  if (a) return `since ${a}`;
+  if (b) return `up to ${b}`;
+  return "all dates";
 }
 
 $("#followed").onclick = () => {

@@ -151,9 +151,10 @@ Both live in the index's `meta` table, next to the model name and the update
 cursor, so they are backed up and copied along with `papers.db` and survive a
 restart. Nothing is kept in the browser.
 
-They drive two buttons, both over the **Since**/**Until** range, which defaults
-to the last 7 days — the buttons fill **Since** in when it is empty, so the
-range actually used is visible and can then be widened.
+They drive two buttons, both over the **Since**/**Until** range. Both bounds are
+optional and neither button touches them: the dates are used exactly as the form
+has them, the same way Search reads them. Leave both empty and the question is
+asked of the whole index.
 
 **Followed authors** lists everything those people posted in the range,
 newest-first. Note this is a *union*: several followed authors means papers by
