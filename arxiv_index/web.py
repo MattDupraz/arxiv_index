@@ -1224,14 +1224,26 @@ PAGE = r"""<!doctype html>
 <style>
 :root {
   --bg: #fbfbfa; --panel: #fff; --ink: #1a1a1a; --muted: #6b6b6b;
-  --line: #e3e3e0; --accent: #7c3f00; --accent-soft: #f0e6d8; --shadow: rgba(0,0,0,.06);
+  --line: #e3e3e0; --accent: #13396b; --accent-soft: #dde7f4; --shadow: rgba(0,0,0,.06);
   --warn: #a5251b;
+  /* Two blues, because the accent has two jobs. --accent is drawn *on* the
+     page (the cog, ghost labels, focus rings) and has to carry against the
+     background; --accent-fill is the filled button, and has to carry white
+     text. On a light page one blue does both; on a dark one they part ways. */
+  --accent-fill: #13396b;
+  --accent-hover: #0c2749;
+  /* A lift on the dark accent, for a glyph that has to be found rather
+     than read. */
+  --accent-bright: #1f5ba8;
 }
 @media (prefers-color-scheme: dark) {
   :root {
     --bg: #16161a; --panel: #1e1e23; --ink: #ececf0; --muted: #9a9aa4;
-    --line: #2e2e36; --accent: #e0a35c; --accent-soft: #2a2118; --shadow: rgba(0,0,0,.3);
+    --line: #2e2e36; --accent: #5b95d8; --accent-soft: #172030; --shadow: rgba(0,0,0,.3);
     --warn: #f0847c;
+    --accent-fill: #1d4f8a;
+    --accent-hover: #163d6b;
+    --accent-bright: #7fb4f0;
   }
 }
 * { box-sizing: border-box; }
@@ -1243,6 +1255,12 @@ header {
   position: sticky; top: 0; z-index: 10; background: var(--panel);
   border-bottom: 1px solid var(--line); box-shadow: 0 1px 3px var(--shadow);
 }
+/* The settings panel makes the header taller than the viewport, and a sticky
+   box that tall pins its top and puts its own bottom out of reach: the page
+   scrolls the results past it and only reaches the panel once the list is
+   spent. While the panel is open the header is an ordinary block, so it
+   scrolls with the page and the panel is where it was left. */
+body.settings-open header { position: static; }
 .wrap { max-width: 900px; margin: 0 auto; padding: 0 20px; }
 h1 { font-size: 16px; font-weight: 600; margin: 0; padding: 14px 0 0; letter-spacing: .01em; }
 h1 span { color: var(--muted); font-weight: 400; }
@@ -1255,9 +1273,10 @@ input[type=search] {
 input[type=search]:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
 button {
   padding: 10px 18px; font-size: 16px; font-family: inherit; font-weight: 500;
-  border: 0; border-radius: 7px; background: var(--accent); color: #fff;
+  border: 0; border-radius: 7px; background: var(--accent-fill); color: #fff;
   cursor: pointer;
 }
+button:hover:not(:disabled) { background: var(--accent-hover); }
 button:disabled { opacity: .5; cursor: default; }
 /* Secondary action. It lives among the filters and must not compete with
    Search, which is what the page is actually for. */
@@ -1279,13 +1298,20 @@ button.ghost:hover:not(:disabled) { background: var(--accent-soft); }
    that describe one. */
 .acts-bar { padding-bottom: 12px; gap: 10px; }
 .acts-bar button {
-  padding: 9px 17px; font-size: 15px;
+  padding: 6px 13px; font-size: 14px;
 }
 .acts-bar button.primary {
-  color: #fff; background: var(--accent); border-color: var(--accent);
+  color: #fff; background: var(--accent-fill); border-color: var(--accent-fill);
 }
+.acts-bar button.primary:hover:not(:disabled) {
+  background: var(--accent-hover); border-color: var(--accent-hover);
+}
+/* Authors are one short name a line; interests are sentences, and take the
+   room. minmax(0,...) so a long line scrolls the field rather than widening
+   its column. */
 #settings {
-  display: grid; gap: 14px 22px; grid-template-columns: 1fr 1fr;
+  display: grid; gap: 14px 22px;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 2fr);
   padding: 4px 0 14px;
 }
 /* An author `display` beats the UA rule for [hidden], so the panel needs to be
@@ -1298,7 +1324,7 @@ button.ghost:hover:not(:disabled) { background: var(--accent-soft); }
 #settings textarea {
   font: inherit; font-size: 14px; line-height: 1.5; padding: 9px 11px;
   border: 1px solid var(--line); border-radius: 7px; background: var(--bg);
-  color: var(--ink); resize: vertical; min-height: 116px;
+  color: var(--ink); resize: vertical; min-height: 336px;
 }
 #settings textarea:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
 .pbar { grid-column: 1 / -1; display: flex; gap: 12px; align-items: center;
@@ -1311,22 +1337,54 @@ button.ghost:hover:not(:disabled) { background: var(--accent-soft); }
           font-size: 13px; color: var(--muted); }
 .pfield b { font-weight: 600; color: var(--ink); font-size: 14px; }
 .ihead { display: flex; gap: 8px; font-size: 12px; padding-top: 3px; }
-.ihead span:first-child { width: 64px; flex: none; }
+.ihead span:first-child { width: 72px; flex: none; }
 #p-interests { display: flex; flex-direction: column; gap: 6px; }
 .interest { display: flex; gap: 8px; align-items: stretch; }
-.interest input[type=number] {
-  width: 64px; flex: none; font: inherit; font-size: 14px; padding: 9px 4px;
+/* A stepper, not a spinner: the UA's arrows are a few pixels tall and drawn
+   in the UA's own style. One box instead, the field spanning both rows with
+   the two arrows stacked in a column at its right edge, so the whole thing
+   reads as a single control the width of its column. Its own height, since a
+   number does not get easier to read by being stretched to the height of the
+   description beside it. */
+.interest .weight {
+  flex: none; align-self: flex-start; width: 72px; height: 58px;
+  display: grid; grid-template-columns: 1fr 24px; grid-template-rows: 1fr 1fr;
+  overflow: hidden;
   border: 1px solid var(--line); border-radius: 7px; background: var(--bg);
-  color: var(--ink); text-align: center;
 }
+.interest .weight:focus-within { outline: 2px solid var(--accent); outline-offset: -1px; }
+.interest .weight input[type=number] {
+  grid-row: 1 / -1; width: 100%; min-width: 0; font: inherit; font-size: 15px;
+  padding: 0; border: 0; background: none; color: var(--ink); text-align: center;
+  font-variant-numeric: tabular-nums;
+  /* The field keeps the keyboard and the validation, and loses the arrows. */
+  -moz-appearance: textfield; appearance: textfield;
+}
+.interest .weight input[type=number]::-webkit-outer-spin-button,
+.interest .weight input[type=number]::-webkit-inner-spin-button {
+  -webkit-appearance: none; margin: 0;
+}
+.interest .weight input[type=number]:focus { outline: none; }
+.interest .weight button {
+  padding: 0; border: 0; border-left: 1px solid var(--line); border-radius: 0;
+  background: none; color: var(--accent-bright); cursor: pointer;
+  font: inherit; font-size: 13px; line-height: 1;
+  display: flex; align-items: center; justify-content: center;
+}
+.interest .weight button:last-child { border-top: 1px solid var(--line); }
+.interest .weight button:hover:not(:disabled) {
+  background: var(--accent-soft); color: var(--ink);
+}
+.interest .weight button:disabled { opacity: .3; cursor: default; }
 /* Overrides the tall single-field default; a description is a line or two.
    Needs the id to outrank `#settings textarea`, which sets min-height. */
 #settings .interest textarea {
-  flex: 1 1 auto; min-height: 0; height: 58px; padding: 7px 10px;
+  flex: 1 1 auto; min-height: 0; height: 84px; padding: 7px 10px;
 }
 .interest .drop {
-  flex: none; width: 30px; padding: 0; font: inherit; font-size: 17px;
-  line-height: 1; border: 1px solid var(--line); border-radius: 7px;
+  flex: none; align-self: stretch; width: 30px; padding: 0;
+  font: inherit; font-size: 17px; line-height: 1;
+  border: 1px solid var(--line); border-radius: 7px;
   background: none; color: var(--muted); cursor: pointer;
 }
 .interest .drop:hover { background: var(--accent-soft); color: var(--ink); }
@@ -1337,8 +1395,13 @@ button.ghost:hover:not(:disabled) { background: var(--accent-soft); }
 .blendrow input[type=range] { flex: 0 1 150px; accent-color: var(--accent); }
 .blendrow output { color: var(--ink); font-variant-numeric: tabular-nums; }
 /* The one control that opens the panel. Square, so the glyph sits centred
-   rather than being letter-spaced like a word. */
-button.cog { font-size: 20px; line-height: 1; padding: 7px 13px; }
+   rather than being letter-spaced like a word: the padding is even, and
+   aspect-ratio takes the width from the height the glyph and padding make. */
+button.cog {
+  font-size: 21px; line-height: 1; padding: 8px; aspect-ratio: 1;
+  display: inline-flex; align-items: center; justify-content: center;
+  color: var(--accent-bright);
+}
 button.cog[aria-expanded="true"] {
   background: var(--accent-soft); color: var(--ink);
 }
@@ -1799,6 +1862,36 @@ function addInterest(entry) {
   weight.value = entry.weight;
   weight.title = "How much this interest counts. 0 switches it off.";
 
+  // The field, and the two arrows stacked at its right edge. The buttons
+  // carry the step, so it is the same 0.1 whether clicked or keyed.
+  const box = document.createElement("div");
+  box.className = "weight";
+  const step = (delta) => {
+    const at = Math.round((Number(weight.value || 0) + delta) * 10) / 10;
+    weight.value = Math.min(2, Math.max(0, at)).toFixed(1);
+    bound();
+  };
+  const arrow = (glyph, delta, label) => {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.textContent = glyph;
+    b.title = label;
+    b.tabIndex = -1;  // The field itself is the tab stop; arrows step it.
+    b.onclick = () => step(delta);
+    return b;
+  };
+  const less = arrow("\u2212", -0.1, "Count this interest less");
+  const more = arrow("+", 0.1, "Count this interest more");
+  // Nothing past the ends, and the button says so rather than going dead.
+  const bound = () => {
+    const at = Number(weight.value || 0);
+    less.disabled = at <= 0;
+    more.disabled = at >= 2;
+  };
+  weight.oninput = bound;
+  bound();
+  box.append(weight, more, less);
+
   const text = document.createElement("textarea");
   text.value = entry.text;
   text.spellcheck = false;
@@ -1821,7 +1914,7 @@ function addInterest(entry) {
     if (!$("#p-interests").children.length) addInterest({text: "", weight: 1});
   };
 
-  row.append(weight, text, drop);
+  row.append(box, text, drop);
   $("#p-interests").append(row);
   return row;
 }
@@ -1858,8 +1951,11 @@ async function loadProfile() {
    profile editor already followed, now covering the schedule too. */
 function showSettings(open) {
   prof.hidden = !open;
+  document.body.classList.toggle("settings-open", open);
   $("#cog").setAttribute("aria-expanded", open ? "true" : "false");
-  if (open) { loadProfile(); loadSchedule(); }
+  // The header stops being sticky as it opens, so anywhere down the results
+  // it would otherwise open off-screen.
+  if (open) { window.scrollTo({top: 0}); loadProfile(); loadSchedule(); }
 }
 
 $("#cog").onclick = () => {
