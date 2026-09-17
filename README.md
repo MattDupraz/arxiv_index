@@ -1,92 +1,33 @@
 # arXiv index — math.AC / math.AG / math.CO
 
 Semantic search over arXiv abstracts in commutative algebra, algebraic geometry
-and combinatorics. Runs entirely on your own machine.
+and combinatorics, running entirely on your own machine. A paper is in scope if
+**any** of its categories is one of the three, so cross-listed work counts —
+~145,000 papers, 747 MB of vectors. Vector search takes ~210 ms, ~800 ms with
+reranking.
 
-A paper is in scope if **any** of its categories is one of the three, so
-cross-listed work (e.g. a `cs.CG math.CO` paper) counts. That is ~145,000 papers.
-
-Once the index exists, day-to-day use is two commands:
+Day-to-day use is two commands:
 
 ```bash
 python3 -m arxiv_index serve      # http://127.0.0.1:8000/
 python3 -m arxiv_index update     # weekly top-up, about a minute
 ```
 
-| | |
-|---|---|
-| vector search | ~210 ms |
-| + reranking the top 50 | ~800 ms |
-| index | 145,853 papers, 747 MB of vectors |
-
-## Where everything lives
-
-This repository is **code only**. No data is committed, so a fresh clone can
-search nothing until you build the index — one 5.5 GB download and a few hours
-of embedding, both described in [First-time setup](#first-time-setup).
-
-```
-arXiv_index/
-├── arxiv_index/                     the package — everything that is in git
-│   └── static/                      vendored KaTeX (no CDN; the UI works offline)
-├── arxiv-metadata-oai-snapshot.json Kaggle dump, 5.5 GB — initial backfill only
-└── index/                           the database; created by the first build
-    ├── papers.db                    SQLite, ~160 MB, one row per paper
-    ├── vectors.f16                  flat float16 vectors, ~750 MB
-    └── embed.lock                   empty file, advisory lock
-```
-
-Both paths come from `arxiv_index/config.py` — `INDEX_DIR` and `SNAPSHOT`,
-resolved relative to the repo root. Nothing else hardcodes a location, so
-pointing `INDEX_DIR` at an external disk moves the whole index. `python3 -m
-arxiv_index status` prints the directory in use, along with what is in it.
-
-Model weights are not here either. Ollama keeps the embedding model in its own
-store (`~/.ollama`, ~2.5 GB), and the reranker is downloaded to
-`~/.cache/huggingface` (~570 MB) the first time reranking is switched on.
-
-### The two index files are a matched set
-
-`papers.db` is the source of truth: each paper's `row` column names its slot in
-`vectors.f16`, and the vector file has no identity of its own. **Back them up
-together, and copy them together.** If they do get separated, the vectors can be
-rebuilt from the metadata — one statement plus the embedding time:
-
-```bash
-sqlite3 index/papers.db "UPDATE papers SET row = NULL"
-rm index/vectors.f16
-python3 -m arxiv_index build --embed-only
-```
-
-The reverse does not work: `vectors.f16` on its own is anonymous numbers.
-
-`embed.lock` is created on demand and holds no state — deleting it while nothing
-is embedding is harmless.
-
 ## First-time setup
 
-**1. Ollama, with the embedding model.**
+The repository is **code only**. A fresh clone can search nothing until you
+build the index: one 5.5 GB download and a few hours of embedding.
 
-```bash
-ollama pull qwen3-embedding:4b
-```
-
-**2. Python 3.11+ with `numpy` and `ollama`.** The arXiv API client, the web
-server and the citation generator use only the standard library.
-
-**3. Optionally torch + transformers**, for reranking and GPU search — a CUDA or
-ROCm build, matching your hardware. Everything else works without them; searches
-simply run on the CPU, unreranked.
-
-**4. The Kaggle snapshot**, for the initial backfill only:
-[kaggle.com/datasets/Cornell-University/arxiv](https://www.kaggle.com/datasets/Cornell-University/arxiv).
-Unzip `arxiv-metadata-oai-snapshot.json` into the repo root (or set
-`config.SNAPSHOT`). It is 5.5 GB and can be deleted once the build finishes;
-after that the index keeps itself current from the arXiv API. There is no
-API-only backfill path — arXiv caps how deep a result set can be paged, so the
-snapshot is how the history gets in.
-
-**5. Build.**
+1. **Ollama with the embedding model:** `ollama pull qwen3-embedding:4b`.
+2. **Python 3.11+ with `numpy` and `ollama`.** Everything else is stdlib.
+3. **Optionally torch + transformers**, for reranking and GPU search. Without
+   them searches run on the CPU, unreranked.
+4. **The Kaggle snapshot**, for the initial backfill only:
+   [kaggle.com/datasets/Cornell-University/arxiv](https://www.kaggle.com/datasets/Cornell-University/arxiv).
+   Unzip `arxiv-metadata-oai-snapshot.json` into the repo root. arXiv caps how
+   deep a result set can be paged, so the snapshot is the only way to get the
+   history in; it can be deleted once the build finishes.
+5. **Build:**
 
 ```bash
 python3 -m arxiv_index build     # scan the snapshot, then embed
@@ -96,20 +37,33 @@ python3 -m arxiv_index serve
 
 The scan takes a couple of minutes; embedding 145k papers takes about three
 hours on a consumer GPU. It is interruptible — `build --embed-only` picks up
-exactly where it stopped, skipping the scan. Budget ~910 MB for the finished
-index, plus the 5.5 GB snapshot while it exists.
+where it stopped. Budget ~910 MB for the finished index.
+
+Paths come from `arxiv_index/config.py` (`INDEX_DIR`, `SNAPSHOT`), so pointing
+`INDEX_DIR` at an external disk moves the whole index. Model weights live in
+`~/.ollama` (~2.5 GB) and `~/.cache/huggingface` (~570 MB).
+
+### The two index files are a matched set
+
+`index/papers.db` is the source of truth: each paper's `row` column names its
+slot in `index/vectors.f16`, which has no identity of its own. **Back them up
+together.** If they are separated, the vectors can be rebuilt:
+
+```bash
+sqlite3 index/papers.db "UPDATE papers SET row = NULL"
+rm index/vectors.f16
+python3 -m arxiv_index build --embed-only
+```
+
+The reverse does not work: `vectors.f16` alone is anonymous numbers.
 
 ## Using it
 
 The web UI has a search box, an author filter, category checkboxes, a date
-range, expandable abstracts, links to the abstract and PDF, a **BibLaTeX**
-button, **Similar papers** on every result, and a [reading
-profile](#your-profile) driving two more buttons. A cog at the right of the
-button row opens [settings](#settings-the-cog): the profile, a **Fetch new
-papers** button that runs the same top-up as `update` without leaving the page,
-and [when to run that automatically](#automatic-updates). LaTeX in titles and
-abstracts is rendered with a vendored copy of KaTeX, so the whole thing works
-offline.
+range, expandable abstracts, a **BibLaTeX** button and **Similar papers** on
+every result. LaTeX is rendered with a vendored KaTeX, so it works offline. The
+cog opens settings: your profile, a **Fetch new papers** button, and when to run
+that automatically.
 
 ```bash
 python3 -m arxiv_index search "toric degenerations of flag varieties"
@@ -119,135 +73,73 @@ python3 -m arxiv_index search --author "Hardy, Littlewood"  # no query needed
 python3 -m arxiv_index similar 0704.0002
 ```
 
-`--rerank` enables reranking from the CLI, `--scores` shows relevance numbers,
-and `--json` prints full records.
+**Reranking** rescores the top 50 hits with a cross-encoder, which is markedly
+better ordering — known-item recall@1 goes from 0.50 to 0.86 — at about a second
+per search. It needs torch and a GPU; the **Rerank** checkbox appears only when
+they are installed. Author-only listings skip it, having no query to be relevant
+to.
 
-**Reranking** rescores the top 50 hits with a cross-encoder that reads the query
-and abstract together. It is markedly better ordering — known-item recall@1 goes
-from 0.50 to 0.86 — at about a second per search, and it needs torch and a GPU.
-The **Rerank** checkbox controls it in the web UI, and appears only when torch
-and transformers are installed — there is no point offering an option that
-cannot run. Reranking is skipped automatically for author-only listings, where
-there is no query to be relevant to, and if the model fails to load the search
-falls back to vector order and says why rather than failing.
-
-**Scores are hidden by default** in both interfaces — they are diagnostics, not
-reading material. The **Scores** checkbox reveals them in the web UI and
-`--scores` does the same on the CLI; a reranked hit then shows both its relevance
-logit and the cosine it started from, since the two are on unrelated scales.
-
-**Similar papers** works the same way, with the source paper's own text standing
-in for the query. Reranking it costs about a second against 8 ms for the plain
-vector lookup, so it is worth leaving off when skimming.
-
-### Settings: the cog
-
-Everything that is configuration rather than a search lives behind the cog at
-the right of the button row — your profile, when the index tops itself up, and
-the **Fetch new papers** button. It is shut by default and nothing in it is
-kept in the browser: opening it re-reads the server, so what is on screen is
-what is stored.
-
-The profile has an explicit **Save** because it is prose being embedded.
-Everything under **Automatic updates** saves the moment you change it — a
-switch that needs a second confirming click is a switch people believe they
-have already set.
+**Scores are hidden by default** in both interfaces. The **Scores** checkbox and
+`--scores` reveal them.
 
 ### Your profile
 
-The profile is two fields that describe *you* rather than a search:
+Two fields describing *you* rather than a search, stored in the index's `meta`
+table so they travel with `papers.db`:
 
 | | |
 |---|---|
-| **Followed authors** | one name per line — people whose papers are worth seeing whatever they are about |
+| **Followed authors** | one name per line — people worth reading whatever they write |
 | **Research interests** | one short description per thing you work on, each with a weight |
 
-Both live in the index's `meta` table, next to the model name and the update
-cursor, so they are backed up and copied along with `papers.db` and survive a
-restart. Nothing is kept in the browser.
-
-They drive two buttons, both over the **Since**/**Until** range. Both bounds are
-optional and neither button touches them: the dates are used exactly as the form
-has them, the same way Search reads them. Leave both empty and the question is
-asked of the whole index.
+They drive two buttons, both over the **Since**/**Until** range, which is used
+exactly as the form has it. Leave both empty to ask the whole index.
 
 **Followed authors** lists everything those people posted in the range,
-newest-first. Note this is a *union*: several followed authors means papers by
-any of them, which is the opposite of the author box, where several names mean
-papers they wrote **together**. Put one name per line.
-The listing covers papers that are not embedded yet, and says `12 of 40 results`
-when the range holds more than it shows.
+newest-first. This is a *union* — the opposite of the author box, where several
+names mean papers written **together**.
 
-**Rank by my interests** takes the same range and orders it by how close each
-abstract is to what you work on. This is the embedding only — no reranking. The
-cross-encoder scores a *query* against a document, and a standing description of
-what you work on is not a query; it would also cap the listing at the 50-paper
-shortlist, which is wrong for something meant to cover a window. Only embedded
-papers can be ranked, and an empty result says how many are still waiting.
+**Rank by my interests** orders the same range by closeness to what you work on.
+Embedding only, no reranking, and only embedded papers can be ranked.
 
-#### Interests are a list, not a paragraph
+Write one interest per project rather than one paragraph: each is embedded
+**separately**, so they stay distinct instead of averaging into a point that is
+squarely none of them. Each carries a weight from `0` to `2` (default `1`);
+`0` parks an entry without deleting it.
 
-Write one short description per project. Each is embedded **separately**, so
-they stay distinct: a single paragraph has to become a single point in the
-space, which lands in the middle of everything you do and is squarely none of
-it.
-
-Each entry carries a **weight** — how much that project counts, from `0` to `2`
-in steps of `0.1`, `1` by default. `0` switches an entry off without deleting
-it, which is the cheap way to park something you are not reading this month.
-
-A paper is scored against every interest. Those scores are multiplied by their
-weights, sorted best-first, and added up with each one after the first counting
-less: the first in full, the second times *b*, the third times *b²*, and so on.
-The **Reward for matching several** slider is *b*, and it spans exactly the two
-rules you might have wanted instead:
+A paper is scored against every interest, the scores are multiplied by their
+weights and sorted, and each after the first counts less — the first in full,
+the second times *b*, the third times *b²*. The **Reward for matching several**
+slider is *b*:
 
 | *b* | what it does |
 |---|---|
-| `0` | only the best match counts — a weighted maximum. A paper squarely on one project wins outright. |
-| `0.35` | the default. The best match dominates, but genuinely matching a second project still lifts a paper. |
-| `1` | every match counts in full — a weighted sum, which ranks identically to averaging your interests into one vector. |
+| `0` | only the best match counts. A paper squarely on one project wins outright |
+| `0.35` | the default. The best match dominates, but a genuine second match still lifts a paper |
+| `1` | every match counts in full, which ranks identically to averaging your interests into one vector |
 
-The difference is real. On this index, with three interests, `0` puts
-`$K$-rings of wonderful varieties and matroids` first and a paper touching
-several projects sixth; `1` promotes the papers that are vaguely near
-everything, which is the failure mode the list was meant to fix.
-
-Each description is embedded once, when you save it, and its vector is stored in
-the same record — so ranking a range is one pass over the matrix no matter how
-many interests you keep, and editing one entry re-embeds only that entry.
-Changing a weight or the slider embeds nothing at all. If Ollama is unreachable
-when you save, the text is stored anyway and that row is flagged as unrankable
-until you save again; a vector never outlives the wording it came from, so an
-edited description is never ranked by its previous embedding.
-
-An interests paragraph written by an earlier version is read as a single
-weighted entry, embedding and all — nothing to retype, and nothing to re-embed.
+Descriptions are embedded on save, so changing a weight or the slider embeds
+nothing. If Ollama is unreachable the text is stored anyway and flagged as
+unrankable until you save again.
 
 ### Searching by author
 
-Works alone — leave the query empty for that author's papers newest-first — or
-alongside a query, which then ranks their work by relevance to it.
+Works alone — newest-first for that author — or alongside a query, which ranks
+their work by relevance to it.
 
 **Several names, comma-separated, mean papers written *together*.** `Hardy,
-Littlewood` returns only their joint papers — for one pair in this index, 8 of
-them rather than the 197 written by one or the other. `;` and `and` also
-separate. A single name written surname-first, `Hardy, Godfrey`, works too and
-does better than `Godfrey Hardy`: the terms match independently, so it also
-finds "Godfrey H. Hardy". The trade-off is that the terms need not belong to one
-person — a paper by someone called Godfrey and someone else called Hardy matches
-too — the price of one comma meaning both things.
+Littlewood` returns their 8 joint papers rather than the 197 written by one or
+the other; `;` and `and` also separate. A single name written surname-first
+works too, and does better than `Godfrey Hardy`, since the terms match
+independently and so also find "Godfrey H. Hardy".
 
 **Names match regardless of case and accents**, since arXiv stores many author
-fields as LaTeX (`Poincar\'e`, `Erd\H{o}s`, `{\O}re`). Typing the plain ASCII
-spelling of one surname in the corpus returns its 166 papers; a literal
-substring match returns the 1 record that happens to be written without the
-accents. Affiliations riding along in the field are stripped, so a place name
-does not match everyone who works there.
+fields as LaTeX (`Poincar\'e`, `Erd\H{o}s`). Affiliations riding along in the
+field are stripped.
 
-One asymmetry worth knowing: **with** a query, only embedded papers can come
-back, because ranking needs a vector. **Without** one, the listing is pure
-metadata and covers every paper in the database, embedded or not.
+One asymmetry: **with** a query only embedded papers come back, since ranking
+needs a vector. **Without** one, the listing is pure metadata and covers every
+paper in the database.
 
 ## Keeping it current
 
@@ -255,73 +147,44 @@ metadata and covers every paper in the database, embedded or not.
 python3 -m arxiv_index update
 ```
 
-or the **Fetch new papers** button under the cog in the web UI, which runs
-exactly this.
+or the **Fetch new papers** button, which runs exactly this. It walks the arXiv
+API back from the newest paper to the stored cursor, embeds what is new, and
+advances the cursor. Papers whose title or abstract changed are re-embedded. The
+cursor advances *only* when a walk provably reached it: a run cut short says
+`WALK INCOMPLETE`, keeps what it fetched and leaves the cursor alone, so the
+failure mode is wasted work rather than a gap.
 
-Walks the arXiv API back from the newest paper until it reaches the stored
-cursor, embeds what is new, advances the cursor. Papers whose title or abstract
-changed are re-embedded; papers that merely gained a DOI are not. The Kaggle
-snapshot is not involved, and can be deleted after the initial build.
+Embedding takes an exclusive lock (`index/embed.lock`), so an `update` firing
+during a long `build` exits cleanly. Searching during a build is fine.
+
+From the web UI the run belongs to the server rather than the tab, so closing
+the page does not stop it and reopening picks it back up. One runs at a time.
 
 ### Automatic updates
 
-An index goes stale behind a server left running for a week, which is the whole
-reason the button exists. Under the cog, **Automatic updates** presses it on a
-clock instead, for as long as `serve` is up:
+Under the cog, **Automatic updates** presses the button on a clock for as long
+as `serve` is up, so an index does not go stale behind a server left running:
 
 | | |
 |---|---|
-| **Off** | the default — nothing runs unless you press the button |
+| **Off** | the default |
 | **Every N hours** | measured from the end of the last run, 1 to 168 |
 | **Daily at HH:MM** | a wall-clock time, in the server machine's **local** time |
 
-Local time rather than UTC on purpose: someone asking for 07:00 means 07:00
-where they are, and arXiv's own announcements go out at a fixed New York time
-rather than anything you would want to convert by hand.
+Local rather than UTC on purpose: 07:00 means 07:00 where you are, and arXiv's
+announcements go out at a fixed New York time.
 
-**A missed run is caught up, not skipped.** A daily 07:00 run on a machine that
-was asleep until 09:00 fires at 09:00, because the useful reading of "daily at
-07:00" is "once a day, in the morning" — not "only ever at exactly 07:00". The
-same goes for switching the setting on at all: if a slot has already passed and
-nothing has run since, the first run happens within the minute.
+**A missed run is caught up, not skipped.** A daily 07:00 run on a machine
+asleep until 09:00 fires at 09:00. Switching the setting on works the same way:
+if a slot has passed and nothing has run since, the first run happens within the
+minute. Manual runs count, so **Fetch new papers** resets the clock.
 
-Manual runs count as runs. Pressing **Fetch new papers** resets the clock, so
-the scheduler does not follow you with a second fetch minutes later, and that
-record is stored in the index rather than in memory — a restart does not
-re-trigger a run that already happened.
-
-Only one runs at a time. If a long backlog is still going when the next slot
-comes round, that slot is passed over rather than queued, and the check simply
-asks again on its next tick.
-
-The scheduler is a daemon thread that wakes every 30 seconds and re-reads the
-setting, so a change in the UI takes effect within the tick rather than at the
-next restart. The whole of the "when" is pure functions in `schedule.py` over
-the setting and two timestamps, which is why the awkward cases above can be
-checked directly instead of by waiting around for a clock.
+Changes take effect within 30 seconds, no restart needed. For updates without a
+server running, use cron:
 
 ```cron
 0 7 * * 1  cd /path/to/arXiv_index && python3 -m arxiv_index update >> update.log 2>&1
 ```
-
-**Can it miss a paper?** The cursor advances *only* when a walk provably reached
-it. A run cut short says `WALK INCOMPLETE`, leaves the cursor alone, and keeps
-what it fetched, so the failure mode is wasted work rather than a gap. Re-run
-with a larger `--max-pages`.
-
-Embedding runs take an exclusive lock (`index/embed.lock`), so a cron `update`
-firing during a long `build` exits cleanly instead of double-embedding.
-Searching during a build is fine.
-
-**From the web UI**, the button starts the run in the background and the page
-polls it — a weekly top-up is about a minute, most of it embedding rather than
-fetching, and a long absence is many minutes of paging. It reports each page as
-it is scanned, then the embedding count, then what it took. The run belongs to the server
-rather than to the tab, so closing or reloading the page does not stop it —
-reopening picks the run back up. One runs at a time; a second click while one
-is going is refused rather than queued, and a run blocked by the embed lock, an
-unreachable Ollama or a failed API call says so in place of the progress line
-instead of taking the server down. Searching works throughout.
 
 ## Commands
 
@@ -340,20 +203,11 @@ instead of taking the server down. Searching works throughout.
 `serve` binds to `127.0.0.1` by default. The server exposes the index and,
 indirectly, Ollama, so think before changing `--host`.
 
-## Tuning
-
-Everything adjustable is in `arxiv_index/config.py`, with the measurements
-behind each choice in the comments — the models, the shortlist size, whether
-search runs on the GPU. Changing `CATEGORIES` and re-running `build` adds
-categories without re-embedding what you already have, and changing the
-embedding model makes the index refuse to load rather than silently mixing
-incomparable vectors.
-
-Deeper background — why search is brute-force, how the reranker was chosen,
-what the server holds in memory, and what was tried and abandoned — is in
-[NOTES.md](NOTES.md).
-
 ## Source layout
+
+Everything adjustable is in `config.py`, with the measurements behind each
+choice in the comments. Deeper background — why search is brute-force, how the
+reranker was chosen, what was tried and abandoned — is in [NOTES.md](NOTES.md).
 
 | | |
 |---|---|
