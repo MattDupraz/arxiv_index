@@ -27,6 +27,7 @@ paper only if arXiv itself omits it from a successful response.
 """
 
 import datetime as dt
+import ssl
 import time
 import urllib.error
 import urllib.parse
@@ -35,7 +36,7 @@ import xml.etree.ElementTree as ET
 
 from . import config, store
 
-API = "http://export.arxiv.org/api/query"
+API = "https://export.arxiv.org/api/query"
 NS = {
     "atom": "http://www.w3.org/2005/Atom",
     "arxiv": "http://arxiv.org/schemas/atom",
@@ -119,6 +120,30 @@ def _parse_entry(entry) -> dict:
 # --- Fetching ---------------------------------------------------------------
 
 
+_OPENER = None
+
+
+def _opener():
+    """A urllib opener whose TLS handshake advertises ALPN "http/1.1".
+
+    Python's default SSL context offers no ALPN at all, which makes its
+    ClientHello distinctive enough that arXiv's CDN rejects the request with
+    406 before it ever reaches the API. Only cached responses get through, so
+    the failure looks intermittent: repeat a URL and it may succeed, while the
+    fresh page offsets a walk actually needs always fail. Advertising
+    "http/1.1" -- and only that, since urllib cannot speak HTTP/2 -- makes the
+    handshake ordinary and the 406s stop.
+    """
+    global _OPENER
+    if _OPENER is None:
+        context = ssl.create_default_context()
+        context.set_alpn_protocols(["http/1.1"])
+        _OPENER = urllib.request.build_opener(
+            urllib.request.HTTPSHandler(context=context)
+        )
+    return _OPENER
+
+
 def _query() -> str:
     return " OR ".join(f"cat:{c}" for c in config.CATEGORIES)
 
@@ -141,7 +166,7 @@ def _fetch(start: int, page_size: int = PAGE_SIZE, retries: int = 4):
     last = None
     for attempt in range(retries):
         try:
-            with urllib.request.urlopen(request, timeout=60) as response:
+            with _opener().open(request, timeout=60) as response:
                 root = ET.fromstring(response.read())
             node = root.find("opensearch:totalResults", NS)
             total = int(node.text) if node is not None and node.text else None
