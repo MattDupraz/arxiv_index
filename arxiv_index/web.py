@@ -17,6 +17,7 @@ faster once the matrix is already in memory.
 Binds to localhost only: the server exposes the index and, indirectly, Ollama.
 """
 
+import collections
 import datetime as dt
 import json
 import mimetypes
@@ -31,7 +32,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 import numpy as np
 
 from . import (cite, config, rerank as rerank_mod, search as search_mod,
-               store, textnorm)
+               store, textnorm, update as update_mod)
 
 # Vendored KaTeX (js, css, woff2 subset). Kept local rather than pulled from a
 # CDN so the UI still works offline and does not phone home.
@@ -386,6 +387,129 @@ class ResidentIndex:
         return results[:k], time.monotonic() - started, None
 
 
+class Updater:
+    """Runs `update` in the background, for the UI's "Fetch new papers" button.
+
+    A top-up walks the arXiv API and then embeds what came back. A week's
+    worth is three or four pages and about a minute all told, most of it
+    embedding; a long absence is many minutes of paging at one request per
+    three seconds. Either way it is far too long to hold an HTTP request open,
+    so the request that starts one returns immediately and the page polls for
+    progress instead. Only one runs at a time; a second click while one is in
+    flight is refused rather than queued.
+
+    The thread opens its *own* SQLite connection rather than borrowing the
+    resident index's. WAL lets one writer and many readers coexist, whereas
+    holding the index lock for the length of a run would stall every search
+    behind it. Nothing else is needed to make the new papers searchable: the
+    next query calls refresh_if_stale(), sees the count move and re-maps.
+    """
+
+    KEEP_LINES = 200        # a normal run prints a handful; a backlog, more
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._thread = None
+        self.state = "idle"         # idle | running | done | failed
+        self.lines = collections.deque(maxlen=self.KEEP_LINES)
+        self.started = None
+        self.finished = None
+        self.embedded = 0
+        self.progress = None        # (done, total) while embedding
+        self.error = None
+
+    def _alive(self) -> bool:
+        return self._thread is not None and self._thread.is_alive()
+
+    def _in_flight(self) -> bool:
+        """Whether a run is still going.
+
+        Both halves are needed. `_run` records its outcome and only then
+        returns, so between those two moments the thread is alive but the run
+        is over -- asking liveness alone would refuse a click made in that
+        window, which is exactly when someone who just watched a run finish
+        clicks again.
+        """
+        return self.state == "running" and self._alive()
+
+    def start(self) -> bool:
+        """Kick off a run. False if one is already going."""
+        with self._lock:
+            if self._in_flight():
+                return False
+            self.state = "running"
+            self.lines.clear()
+            self.started = time.time()
+            self.finished = None
+            self.embedded = 0
+            self.progress = None
+            self.error = None
+            # Daemonic, so Ctrl-C on the server is not held hostage by a long
+            # embedding run. Nothing is lost by cutting one short: batches are
+            # committed as they land, and `update` advances the cursor only
+            # after the work is stored, so the next run resumes from there.
+            self._thread = threading.Thread(target=self._run, daemon=True)
+            self._thread.start()
+            return True
+
+    def _log(self, *args) -> None:
+        text = " ".join(str(a) for a in args).rstrip()
+        with self._lock:
+            self.lines.extend(text.split("\n"))
+        # The terminal running `serve` keeps seeing the run as it always did.
+        print(text, flush=True)
+
+    def _progress(self, done: int, total: int) -> None:
+        with self._lock:
+            self.progress = (done, total)
+
+    def _run(self) -> None:
+        db = None
+        try:
+            db = store.connect()
+            embedded = update_mod.update(db, log=self._log,
+                                         progress=self._progress)
+        except (Exception, SystemExit) as exc:  # noqa: BLE001
+            # SystemExit deliberately included: the embed lock, the model check
+            # and the Ollama probe all raise it to end a CLI run, and none of
+            # them is a reason to take the server down.
+            message = str(exc) or exc.__class__.__name__
+            with self._lock:
+                self.state, self.error = "failed", message
+                self.finished, self.progress = time.time(), None
+            self._log(f"update failed: {message}")
+        else:
+            with self._lock:
+                self.state, self.embedded = "done", embedded
+                self.finished, self.progress = time.time(), None
+        finally:
+            if db is not None:
+                db.close()
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            state = self.state
+            if state == "running" and not self._alive():
+                # The thread went without recording an outcome -- only a
+                # BaseException other than SystemExit can do that. Say so
+                # rather than leaving the page polling a run that is over.
+                state = self.state = "failed"
+                self.error = self.error or "the update thread stopped"
+            payload = {
+                "state": state,
+                "lines": list(self.lines),
+                "embedded": self.embedded,
+                "error": self.error,
+            }
+            if self.started:
+                payload["elapsed"] = round(
+                    (self.finished or time.time()) - self.started)
+            if state == "running" and self.progress:
+                done, total = self.progress
+                payload["progress"] = {"done": done, "total": total}
+        return payload
+
+
 GRACE_PERIOD = 10.0     # seconds to let in-flight requests finish on shutdown
 
 
@@ -426,7 +550,7 @@ class GracefulHTTPServer(ThreadingHTTPServer):
             return self._in_flight
 
 
-def make_handler(index: ResidentIndex):
+def make_handler(index: ResidentIndex, updater: Updater):
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
 
@@ -478,6 +602,28 @@ def make_handler(index: ResidentIndex):
             finally:
                 self.server.request_finished()
 
+        def do_POST(self):
+            self.server.request_started()
+            try:
+                # Drain the body even though nothing here takes one: leaving it
+                # in the socket would desynchronise the keep-alive connection.
+                length = int(self.headers.get("Content-Length") or 0)
+                if length:
+                    self.rfile.read(length)
+                if urlparse(self.path).path == "/api/update":
+                    # POST, not GET: this walks the arXiv API and writes to the
+                    # index, which is no business of a reload or a prefetch.
+                    if not updater.start():
+                        self._json(updater.snapshot() |
+                                   {"error": "An update is already running."},
+                                   409)
+                        return
+                    self._json(updater.snapshot())
+                    return
+                self._send(b"not found", "text/plain", 404)
+            finally:
+                self.server.request_finished()
+
         def _route(self):
             parsed = urlparse(self.path)
             params = parse_qs(parsed.query)
@@ -499,6 +645,13 @@ def make_handler(index: ResidentIndex):
 
             if parsed.path == "/api/stats":
                 self._json(index.stats())
+                return
+
+            if parsed.path == "/api/update":
+                # Progress of the current or most recent run. The server is the
+                # only source of truth about whether one is in flight, so a
+                # reloaded page asks here rather than assuming it is idle.
+                self._json(updater.snapshot())
                 return
 
             if parsed.path == "/api/search":
@@ -605,7 +758,7 @@ def serve(port: int = 8000, host: str = "127.0.0.1", open_browser: bool = True):
     print(f"{stats['embedded']:,} papers resident ({size:,.0f} MB in {where})"
           + (f", {stats['pending']:,} still embedding" if stats["pending"] else ""))
 
-    server = GracefulHTTPServer((host, port), make_handler(index))
+    server = GracefulHTTPServer((host, port), make_handler(index, Updater()))
     url = f"http://{host}:{port}/"
     print(f"\n  {url}\n\nCtrl-C (or SIGTERM) to stop.")
     if open_browser:
@@ -653,11 +806,13 @@ PAGE = r"""<!doctype html>
 :root {
   --bg: #fbfbfa; --panel: #fff; --ink: #1a1a1a; --muted: #6b6b6b;
   --line: #e3e3e0; --accent: #7c3f00; --accent-soft: #f0e6d8; --shadow: rgba(0,0,0,.06);
+  --warn: #a5251b;
 }
 @media (prefers-color-scheme: dark) {
   :root {
     --bg: #16161a; --panel: #1e1e23; --ink: #ececf0; --muted: #9a9aa4;
     --line: #2e2e36; --accent: #e0a35c; --accent-soft: #2a2118; --shadow: rgba(0,0,0,.3);
+    --warn: #f0847c;
   }
 }
 * { box-sizing: border-box; }
@@ -685,6 +840,22 @@ button {
   cursor: pointer;
 }
 button:disabled { opacity: .5; cursor: default; }
+/* Secondary action. It lives among the filters and must not compete with
+   Search, which is what the page is actually for. */
+button.ghost {
+  padding: 4px 11px; font-size: 13px; background: none; color: var(--accent);
+  border: 1px solid var(--line);
+}
+button.ghost:hover:not(:disabled) { background: var(--accent-soft); }
+.grow { flex: 1 1 auto; }
+/* One line, and only while there is something to say. Monospace because what
+   it carries is the updater's own output. */
+#update {
+  padding: 0 0 12px; font-size: 13px; color: var(--muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+#update.bad { color: var(--warn); }
 .opts {
   display: flex; gap: 16px; align-items: center; flex-wrap: wrap;
   padding-bottom: 12px; font-size: 14px; color: var(--muted);
@@ -788,7 +959,11 @@ mark { background: var(--accent-soft); color: inherit; }
         <option>50</option><option>100</option><option>250</option>
       </select>
     </label>
+    <span class="grow"></span>
+    <button type="button" id="fetch" class="ghost"
+            title="Walk the arXiv API back to where the last run stopped, then embed whatever is new">Fetch new papers</button>
   </div>
+  <div id="update" hidden></div>
 </div></header>
 
 <div class="wrap">
@@ -907,14 +1082,21 @@ const esc = s => (s||"").replace(/[&<>"]/g, c =>
   ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 const tidy = s => (s||"").replace(/\s+/g, " ").trim();
 
-let stats = null;
-fetch("/api/stats").then(r => r.json()).then(s => {
-  stats = s;
-  $("#scope").textContent = "· " + s.categories.join(" · ");
-  note();
-});
+let stats = null, lastNote = null;
 
+function refreshStats() {
+  return fetch("/api/stats").then(r => r.json()).then(s => {
+    stats = s;
+    $("#scope").textContent = "· " + s.categories.join(" · ");
+    note();
+  });
+}
+refreshStats();
+
+/* `extra` is remembered rather than passed through, so re-reading the counts
+   after a fetch finishes does not wipe the line describing what is on screen. */
 function note(extra) {
+  if (extra !== undefined) lastNote = extra;
   let bits = [];
   if (stats) {
     bits.push(stats.embedded.toLocaleString() + " papers searchable");
@@ -922,7 +1104,7 @@ function note(extra) {
       bits.push(stats.pending.toLocaleString() + " still embedding — "
                 + "results improve as the build finishes");
   }
-  if (extra) bits.unshift(extra);
+  if (lastNote) bits.unshift(lastNote);
   $("#status").textContent = bits.join("  ·  ");
 }
 
@@ -1081,6 +1263,85 @@ async function copyCite(card) {
   }
   setTimeout(() => { flash.textContent = ""; }, 2500);
 }
+
+/* ---- Fetching new papers ----------------------------------------------
+   The button starts a top-up on the server and then polls it. It cannot wait
+   on the response: a week's catch-up is about a minute, mostly embedding, and
+   coming back from a long absence is many minutes of paging.
+
+   The server owns the answer to "is one running?", which is also how a page
+   reloaded mid-run picks the run back up instead of offering to start a
+   second one. */
+
+const fetchBtn = $("#fetch"), updBox = $("#update");
+let updTimer = null;
+// Whether this page has seen the current run go by. A finished run stays on
+// the server until the next one, and a reload an hour later should not
+// announce it as though it had just happened.
+let watched = false;
+
+function showUpdate(text, bad) {
+  updBox.textContent = text;
+  updBox.classList.toggle("bad", !!bad);
+  updBox.hidden = false;
+}
+
+function updateState(s) {
+  const running = s.state === "running";
+  fetchBtn.disabled = running;
+  fetchBtn.textContent = running ? "Fetching…" : "Fetch new papers";
+  if (running) watched = true;
+
+  if (running) {
+    // Embedding is the long half and reports a count; the walk before it only
+    // has its own narration to offer, so show whichever exists.
+    showUpdate(s.progress
+      ? `Embedding ${s.progress.done.toLocaleString()} of `
+        + `${s.progress.total.toLocaleString()}…`
+      : (s.lines.length ? s.lines[s.lines.length - 1].trim() : "Starting…"));
+  } else if (!watched) {
+    updBox.hidden = true;
+  } else if (s.state === "failed") {
+    showUpdate("Update failed: " + (s.error || "unknown error"), true);
+  } else if (s.state === "done") {
+    showUpdate((s.embedded
+      ? `Fetched and embedded ${s.embedded.toLocaleString()} paper(s)`
+      : "Already up to date") + ` · ${s.elapsed}s`);
+  } else {
+    updBox.hidden = true;
+  }
+
+  if (running && !updTimer) {
+    updTimer = setInterval(pollUpdate, 1500);
+  } else if (!running && updTimer) {
+    clearInterval(updTimer);
+    updTimer = null;
+    // The header counts were read once at load; a finished run has moved them.
+    refreshStats();
+  }
+}
+
+async function pollUpdate() {
+  try {
+    updateState(await (await fetch("/api/update")).json());
+  } catch (e) { /* transient — the next tick asks again */ }
+}
+
+fetchBtn.onclick = async () => {
+  fetchBtn.disabled = true;
+  watched = true;
+  showUpdate("Starting…");
+  try {
+    // A 409 means someone else got there first; its body is the live state,
+    // so handing it to updateState() shows that run rather than an error.
+    updateState(await (await fetch("/api/update", {method: "POST"})).json());
+  } catch (e) {
+    showUpdate("Could not start the update: " + e.message, true);
+    fetchBtn.disabled = false;
+  }
+};
+
+pollUpdate();
 
 function similar(id, title) {
   // Honour the same checkbox as search: the cross-encoder scores a text pair

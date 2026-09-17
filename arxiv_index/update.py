@@ -154,7 +154,7 @@ def _fetch(start: int, page_size: int = PAGE_SIZE, retries: int = 4):
     raise RuntimeError(f"arXiv API request failed after {retries} attempts: {last}")
 
 
-def fetch_since(cursor: dt.datetime, max_pages: int = MAX_PAGES):
+def fetch_since(cursor: dt.datetime, max_pages: int = MAX_PAGES, log=print):
     """Walk newest-first until reaching `cursor`.
 
     Returns (records, newest_seen, complete). `complete` is True only if the
@@ -162,8 +162,8 @@ def fetch_since(cursor: dt.datetime, max_pages: int = MAX_PAGES):
     otherwise.
     """
     floor = cursor - OVERLAP
-    print(f"Querying arXiv for {', '.join(config.CATEGORIES)} updated since "
-          f"{floor:%Y-%m-%d %H:%M} UTC")
+    log(f"Querying arXiv for {', '.join(config.CATEGORIES)} updated since "
+        f"{floor:%Y-%m-%d %H:%M} UTC")
 
     records, newest = [], None
     consumed = pages = empty_streak = 0
@@ -183,8 +183,8 @@ def fetch_since(cursor: dt.datetime, max_pages: int = MAX_PAGES):
                 break
             empty_streak += 1
             if empty_streak > EMPTY_RETRIES:
-                print(f"  arXiv returned {empty_streak} empty pages at offset "
-                      f"{consumed}; stopping short.")
+                log(f"  arXiv returned {empty_streak} empty pages at offset "
+                    f"{consumed}; stopping short.")
                 break
             time.sleep(REQUEST_DELAY * empty_streak)
             continue  # retry the same offset; not a new page
@@ -203,8 +203,7 @@ def fetch_since(cursor: dt.datetime, max_pages: int = MAX_PAGES):
 
         consumed += len(entries)
         pages += 1
-        print(f"  page {pages}: {consumed:,} scanned, {len(records):,} in window",
-              flush=True)
+        log(f"  page {pages}: {consumed:,} scanned, {len(records):,} in window")
 
         if complete:
             break
@@ -214,10 +213,10 @@ def fetch_since(cursor: dt.datetime, max_pages: int = MAX_PAGES):
         time.sleep(REQUEST_DELAY)
 
     if not complete:
-        print(f"  WALK INCOMPLETE after {pages} pages ({consumed:,} entries) -- "
-              f"never reached {floor:%Y-%m-%d %H:%M}.\n"
-              f"  Cursor will NOT advance, so nothing is skipped. Re-run with "
-              f"--max-pages above {max_pages} to finish catching up.")
+        log(f"  WALK INCOMPLETE after {pages} pages ({consumed:,} entries) -- "
+            f"never reached {floor:%Y-%m-%d %H:%M}.\n"
+            f"  Cursor will NOT advance, so nothing is skipped. Re-run with "
+            f"--max-pages above {max_pages} to finish catching up.")
     return records, newest, complete
 
 
@@ -242,11 +241,16 @@ def default_cursor(db) -> dt.datetime:
     return dt.datetime(1991, 1, 1, tzinfo=dt.timezone.utc)
 
 
-def update(db, max_pages: int = MAX_PAGES) -> int:
-    """Fetch, upsert and embed everything new since the last run."""
+def update(db, max_pages: int = MAX_PAGES, log=print, progress=None) -> int:
+    """Fetch, upsert and embed everything new since the last run.
+
+    `log` takes the narration and `progress` the (done, total) embedding count.
+    Both default to the CLI's behaviour; the web UI passes its own so the run
+    can be watched from the page that started it.
+    """
     store.check_model(db)
     cursor = default_cursor(db)
-    records, newest, complete = fetch_since(cursor, max_pages)
+    records, newest, complete = fetch_since(cursor, max_pages, log=log)
 
     embedded = 0
     if records:
@@ -257,16 +261,16 @@ def update(db, max_pages: int = MAX_PAGES) -> int:
         # fetched minus pending. `added` must NOT be subtracted as well: new
         # papers are themselves part of `pending`, so doing so double-counts
         # them and the figure goes negative.
-        print(f"{len(records):,} fetched -> {added:,} new, "
-              f"{pending - added:,} revised, "
-              f"{len(records) - pending:,} already current "
-              f"({pending:,} to embed).")
+        log(f"{len(records):,} fetched -> {added:,} new, "
+            f"{pending - added:,} revised, "
+            f"{len(records) - pending:,} already current "
+            f"({pending:,} to embed).")
 
         from . import ingest
 
-        embedded = ingest.embed_pending(db)
+        embedded = ingest.embed_pending(db, log=log, progress=progress)
     else:
-        print("No new papers.")
+        log("No new papers.")
 
     # Advance only after the work lands, and only over ground fully covered.
     if complete and newest:

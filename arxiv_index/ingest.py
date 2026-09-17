@@ -92,16 +92,22 @@ def scan_snapshot(db, path=None, chunk: int = 20_000) -> int:
     return matched
 
 
-def embed_pending(db, batch_size: int = None) -> int:
-    """Embed every paper with no vector yet. Safe to interrupt and re-run."""
+def embed_pending(db, batch_size: int = None, log=print, progress=None) -> int:
+    """Embed every paper with no vector yet. Safe to interrupt and re-run.
+
+    `log` receives the framing lines and `progress` the running (done, total)
+    count, so a caller that is not a terminal -- the web UI's Fetch button --
+    can show the same thing without parsing stdout. Left alone, both keep the
+    CLI's behaviour: prose on stdout, a rewriting progress line on stderr.
+    """
     batch_size = batch_size or config.BATCH_SIZE
     total = store.count_pending(db)
     if not total:
-        print("Nothing to embed; index is up to date.")
+        log("Nothing to embed; index is up to date.")
         return 0
 
     embedder.check_available()
-    print(f"Embedding {total:,} papers with {config.MODEL} ...")
+    log(f"Embedding {total:,} papers with {config.MODEL} ...")
     done = 0
     started = time.monotonic()
 
@@ -115,6 +121,9 @@ def embed_pending(db, batch_size: int = None) -> int:
             store.append_vectors(db, [r["id"] for r in rows], vectors)
 
             done += len(rows)
+            if progress is not None:
+                progress(done, total)
+                continue
             elapsed = time.monotonic() - started
             rate = done / elapsed
             remaining = (total - done) / rate if rate else 0
@@ -126,5 +135,8 @@ def embed_pending(db, batch_size: int = None) -> int:
                 flush=True,
             )
 
-    print(f"\nEmbedded {done:,} papers in {(time.monotonic() - started) / 60:.1f} min.")
+    if progress is None and done:
+        # Close the rewriting stderr line so the summary does not land on it.
+        print(file=sys.stderr)
+    log(f"Embedded {done:,} papers in {(time.monotonic() - started) / 60:.1f} min.")
     return done

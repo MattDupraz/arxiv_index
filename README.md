@@ -103,7 +103,8 @@ index, plus the 5.5 GB snapshot while it exists.
 
 The web UI has a search box, an author filter, category checkboxes, a since-date
 filter, expandable abstracts, links to the abstract and PDF, a **BibLaTeX**
-button, and **Similar papers** on every result. LaTeX in titles and abstracts is
+button, **Similar papers** on every result, and a **Fetch new papers** button
+that runs the same top-up as `update` without leaving the page. LaTeX in titles and abstracts is
 rendered with a vendored copy of KaTeX, so the whole thing works offline.
 
 ```bash
@@ -166,6 +167,8 @@ metadata and covers every paper in the database, embedded or not.
 python3 -m arxiv_index update
 ```
 
+or the **Fetch new papers** button in the web UI, which runs exactly this.
+
 Walks the arXiv API back from the newest paper until it reaches the stored
 cursor, embeds what is new, advances the cursor. Papers whose title or abstract
 changed are re-embedded; papers that merely gained a DOI are not. The Kaggle
@@ -183,6 +186,16 @@ with a larger `--max-pages`.
 Embedding runs take an exclusive lock (`index/embed.lock`), so a cron `update`
 firing during a long `build` exits cleanly instead of double-embedding.
 Searching during a build is fine.
+
+**From the web UI**, the button starts the run in the background and the page
+polls it — a weekly top-up is about a minute, most of it embedding rather than
+fetching, and a long absence is many minutes of paging. It reports each page as
+it is scanned, then the embedding count, then what it took. The run belongs to the server
+rather than to the tab, so closing or reloading the page does not stop it —
+reopening picks the run back up. One runs at a time; a second click while one
+is going is refused rather than queued, and a run blocked by the embed lock, an
+unreachable Ollama or a failed API call says so in place of the progress line
+instead of taking the server down. Searching works throughout.
 
 ## Commands
 
