@@ -367,10 +367,8 @@ class ResidentIndex:
 
         The union is the point, and it is where this parts company with the
         author box: that ANDs its names, because "Hardy, Littlewood" asks for
-        their joint work. A follow list is the other thing -- several people
-        whose papers are each worth seeing -- so entries are OR-ed. Within one
-        entry the AND survives, so a single line reading "Hardy, Littlewood"
-        still means the two of them together.
+        their joint work. A follow list is the other thing -- one name per
+        line, each worth seeing on its own -- so the lines are OR-ed.
 
         Returns (results, total). The cap is a display limit, and a listing
         that was truncated has to be able to say so rather than look complete.
@@ -1280,6 +1278,9 @@ button.ghost:hover:not(:disabled) { background: var(--accent-soft); }
 /* The action row: things that run a listing, as against the filters above
    that describe one. */
 .acts-bar { padding-bottom: 12px; gap: 10px; }
+.acts-bar button {
+  padding: 9px 17px; font-size: 15px;
+}
 .acts-bar button.primary {
   color: #fff; background: var(--accent); border-color: var(--accent);
 }
@@ -1337,7 +1338,7 @@ button.ghost:hover:not(:disabled) { background: var(--accent-soft); }
 .blendrow output { color: var(--ink); font-variant-numeric: tabular-nums; }
 /* The one control that opens the panel. Square, so the glyph sits centred
    rather than being letter-spaced like a word. */
-button.cog { font-size: 16px; line-height: 1; padding: 6px 9px; }
+button.cog { font-size: 20px; line-height: 1; padding: 7px 13px; }
 button.cog[aria-expanded="true"] {
   background: var(--accent-soft); color: var(--ink);
 }
@@ -1478,8 +1479,7 @@ mark { background: var(--accent-soft); color: inherit; }
             title="Settings — who you follow, what you work on, and when the index tops itself up">⚙</button>
   </div>
   <div id="settings" hidden>
-    <label><b>Followed authors</b> one per line; a line with several names,
-      like <code>Hardy, Littlewood</code>, means their joint papers
+    <label><b>Followed authors</b> one name per line
       <textarea id="p-authors" rows="6" spellcheck="false"
                 placeholder="Emmy Noether&#10;David Hilbert"></textarea></label>
     <div class="pfield">
@@ -1795,7 +1795,7 @@ function addInterest(entry) {
 
   const weight = document.createElement("input");
   weight.type = "number";
-  weight.min = "0"; weight.max = "10"; weight.step = "0.5";
+  weight.min = "0"; weight.max = "2"; weight.step = "0.1";
   weight.value = entry.weight;
   weight.title = "How much this interest counts. 0 switches it off.";
 

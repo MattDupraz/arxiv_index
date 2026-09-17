@@ -56,7 +56,7 @@ MAX_INTERESTS = 50
 MAX_INTEREST_CHARS = 2_000
 
 DEFAULT_WEIGHT = 1.0
-MAX_WEIGHT = 10.0
+MAX_WEIGHT = 2.0
 
 # How much a second, third, ... matching interest adds; see `blend_decay`.
 DEFAULT_BLEND = 0.35

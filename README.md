@@ -174,8 +174,7 @@ asked of the whole index.
 **Followed authors** lists everything those people posted in the range,
 newest-first. Note this is a *union*: several followed authors means papers by
 any of them, which is the opposite of the author box, where several names mean
-papers they wrote **together**. Within one line the author box's reading
-survives, so a line reading `Hardy, Littlewood` still asks for their joint work.
+papers they wrote **together**. Put one name per line.
 The listing covers papers that are not embedded yet, and says `12 of 40 results`
 when the range holds more than it shows.
 
@@ -193,9 +192,9 @@ they stay distinct: a single paragraph has to become a single point in the
 space, which lands in the middle of everything you do and is squarely none of
 it.
 
-Each entry carries a **weight** — how much that project counts. `0` switches an
-entry off without deleting it, which is the cheap way to park something you are
-not reading this month.
+Each entry carries a **weight** — how much that project counts, from `0` to `2`
+in steps of `0.1`, `1` by default. `0` switches an entry off without deleting
+it, which is the cheap way to park something you are not reading this month.
 
 A paper is scored against every interest. Those scores are multiplied by their
 weights, sorted best-first, and added up with each one after the first counting
