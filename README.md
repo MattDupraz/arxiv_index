@@ -1,4 +1,4 @@
-<h1 align="center"><img src="docs/logo.svg" alt="arXiv index" width="360"></h1>
+# arXiv index
 
 A personal semantic search engine for arXiv, running entirely on your machine.
 
@@ -8,6 +8,8 @@ A personal semantic search engine for arXiv, running entirely on your machine.
 - **Follow authors** and never miss one of their papers.
 
 ![The web UI: a search for "toric degenerations of flag varieties", with the first result's abstract open](docs/screenshot.png)
+
+*Thank you to arXiv for use of its open access interoperability. `arxiv_index` was not reviewed or approved by, nor does it necessarily express or reflect the policies or opinions of, arXiv.*
 
 ## Quick start
 
