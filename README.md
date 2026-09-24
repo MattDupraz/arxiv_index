@@ -41,6 +41,13 @@ GPU, which is faster. Without it everything works, on the CPU.
 
 Every command below is run from this directory.
 
+**The rest can be done in the browser.** Run `python3 -m arxiv_index serve`
+now: with the index still empty, the page it opens is a first-time setup. It
+asks for your categories, then fills the index from the arXiv snapshot (step 3
+says where to get it) or from an index exported by another instance, taking up
+that instance's settings too if it was exported with them, and shows the
+progress. The steps below do the same in a terminal.
+
 If you have an index exported from another machine, skip steps 3 and 4:
 `python3 -m arxiv_index import arxiv-index.tar` installs it (see
 [Exporting and importing](#exporting-and-importing-an-index)).
@@ -168,7 +175,14 @@ python3 -m arxiv_index export arxiv-index.tar    # about 6.3 KB per paper
 python3 -m arxiv_index import arxiv-index.tar    # on the other machine
 ```
 
-The file holds the papers and their embeddings, not your settings or profile.
+The file holds the papers and their embeddings. With `export --settings` it
+also holds your settings file (categories, followed authors, interests, the
+update schedule) and the cached embeddings of your interests, so another
+machine can be set up as a copy of this one. `import --settings` takes them up
+in place of the settings there, which are kept as `config.json.bak`; without
+it they are left out. Settings naming a different embedding model from the
+index's are refused.
+
 Importing refuses an index built with a different embedding model from the one
 your settings name. Where there is an index already, it needs one of:
 
@@ -181,6 +195,22 @@ A running `serve` picks up the result within a few seconds, as it does any
 change to the index. After importing, `update` brings the index up to date,
 and `build` adds any of your categories it does not hold. A merge that
 replaced papers leaves their old vectors unused; `compact` reclaims the space.
+
+### From the web UI
+
+Under the cog, **Import and export** does the same without a terminal:
+
+| | |
+|---|---|
+| **arXiv snapshot** | pick `arxiv-metadata-oai-snapshot.json` to import the papers of your categories the index does not hold yet, like `build`, and optionally embed them |
+| **Exported index** | pick an export to merge into this index or replace it, like `import`; tick **and its settings** to take those up too |
+| **Export index** | downloads an export, like `export`; tick **with your settings** to include them |
+
+The file is streamed between the browser and the server, never held whole, and
+progress shows under the settings. An import's upload needs the tab open until
+it has been read, a minute or two for the snapshot; the embedding or merge that
+follows carries on without it. The section is only shown, and the server only
+accepts these requests, when the page is opened on the machine running `serve`.
 
 ### The two index files are a matched set
 
@@ -202,8 +232,9 @@ The reverse does not work: `vectors.f16` alone is anonymous numbers.
 The web UI has a search box, an author filter, category checkboxes, a date
 range, expandable abstracts, a **BibLaTeX** button and **Similar papers** on
 every result. LaTeX is rendered with a vendored KaTeX, so it works offline. The
-cog opens settings: your profile, a **Fetch new papers** button, and when to run
-that automatically.
+cog opens settings: your profile, a **Fetch new papers** button, when to run
+that automatically, and, on the machine running the server, importing and
+exporting.
 
 ```bash
 python3 -m arxiv_index search "toric degenerations of flag varieties"
@@ -339,8 +370,8 @@ server running, use cron:
 | `status` | settings file, index location, model, counts, and per category how far it is complete |
 | `config` | show your settings file, creating it with the defaults if absent |
 | `compact` | reclaim vector slots left behind by re-embedded papers |
-| `export FILE` | write the index, embeddings included, to one file |
-| `import FILE` | install an exported index; `--merge` adds it to the one here, `--replace` overwrites it |
+| `export FILE` | write the index, embeddings included, to one file; `--settings` adds your settings |
+| `import FILE` | install an exported index; `--merge` adds it to the one here, `--replace` overwrites it, `--settings` takes up its settings |
 
 `serve` binds to `127.0.0.1` by default. The server exposes the index and,
 indirectly, Ollama, so think before changing `--host`.

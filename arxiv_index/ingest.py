@@ -56,23 +56,34 @@ def _record(paper: dict) -> dict:
 
 
 def scan_snapshot(db, categories, path=None, chunk: int = 20_000) -> int:
-    """Backfill `categories` from the snapshot. Returns the count in scope.
-
-    Papers already held are left alone (see store.insert_new_papers), so this
-    can add a category to an index that has others, and an interrupted scan
-    can simply be run again. Each category gets its update cursor only once
-    the scan has finished -- that is what marks it as held -- set to the
-    newest date seen, so the next `update` fills in everything since the
-    snapshot was taken.
-    """
+    """Backfill `categories` from the snapshot file. See scan_lines."""
     path = path or config.SNAPSHOT
     if not path.exists():
         raise SystemExit(
             f"Snapshot not found at {path}\nDownload it from "
             "https://www.kaggle.com/datasets/Cornell-University/arxiv and "
             "give its path to `build`.")
+    with open(path, "r", encoding="utf-8") as fh:
+        return scan_lines(db, categories, fh, path.name, chunk=chunk)
 
-    print(f"Scanning {path.name} for {', '.join(categories)} ...")
+
+def scan_lines(db, categories, lines, name: str, chunk: int = 20_000,
+               log=print, progress=None) -> int:
+    """Backfill `categories` from the snapshot's lines. Returns the count in
+    scope.
+
+    `lines` is the file, or the web UI's upload as it arrives. Papers already
+    held are left alone (see store.insert_new_papers), so this can add a
+    category to an index that has others, and an interrupted scan can simply
+    be run again. Each category gets its update cursor only once every line
+    has been read -- that is what marks it as held -- set to the newest date
+    seen, so the next `update` fills in everything since the snapshot was
+    taken. A source that fails part-way must therefore raise, not just stop.
+
+    `progress`, if given, is called with the count in scope every 10,000
+    lines, in place of the periodic log line.
+    """
+    log(f"Scanning {name} for {', '.join(categories)} ...")
     matched = 0
     seen = 0
     newest = ""
@@ -80,38 +91,39 @@ def scan_snapshot(db, categories, path=None, chunk: int = 20_000) -> int:
     buffer = []
     started = time.monotonic()
 
-    with open(path, "r", encoding="utf-8") as fh:
-        for line in fh:
-            seen += 1
-            if seen % 250_000 == 0:
-                print(f"  {seen:,} lines, {matched:,} in scope", flush=True)
-            # Cheap substring reject before paying for json.loads on 3.1M lines.
-            if not any(c in line for c in categories):
-                continue
-            paper = json.loads(line)
-            if not config.in_scope(paper["categories"], categories):
-                continue
-            matched += 1
-            newest = max(newest, paper.get("update_date") or "")
-            for c in paper["categories"].split():
-                if c in found:
-                    found[c] += 1
-            buffer.append(_record(paper))
-            if len(buffer) >= chunk:
-                store.insert_new_papers(db, buffer)
-                buffer.clear()
+    for line in lines:
+        seen += 1
+        if progress and seen % 10_000 == 0:
+            progress(matched)
+        elif not progress and seen % 250_000 == 0:
+            log(f"  {seen:,} lines, {matched:,} in scope")
+        # Cheap substring reject before paying for json.loads on 3.1M lines.
+        if not any(c in line for c in categories):
+            continue
+        paper = json.loads(line)
+        if not config.in_scope(paper["categories"], categories):
+            continue
+        matched += 1
+        newest = max(newest, paper.get("update_date") or "")
+        for c in paper["categories"].split():
+            if c in found:
+                found[c] += 1
+        buffer.append(_record(paper))
+        if len(buffer) >= chunk:
+            store.insert_new_papers(db, buffer)
+            buffer.clear()
 
     if buffer:
         store.insert_new_papers(db, buffer)
 
     elapsed = time.monotonic() - started
-    print(f"Scanned {seen:,} records in {elapsed:.0f}s; {matched:,} in scope.")
+    log(f"Scanned {seen:,} records in {elapsed:.0f}s; {matched:,} in scope.")
     empty = [c for c, n in found.items() if not n]
     if empty:
         # Most likely a misspelling. Left without a cursor, so it keeps being
         # reported as not held rather than silently fetching nothing.
-        print(f"No papers at all in {', '.join(empty)} -- check the name "
-              f"against https://arxiv.org/category_taxonomy.")
+        log(f"No papers at all in {', '.join(empty)} -- check the name "
+            f"against https://arxiv.org/category_taxonomy.")
     if newest:
         from . import update
 

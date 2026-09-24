@@ -135,22 +135,34 @@ def write_default() -> bool:
         return True
 
 
-def clean_categories(raw) -> list:
+def clean_categories(raw, where=None) -> list:
+    where = where or path()
     if not isinstance(raw, (list, tuple)):
         raise SettingsError(
-            f'"categories" in {path()} must be a list, e.g. ["math.AG"].')
+            f'"categories" in {where} must be a list, e.g. ["math.AG"].')
     out = []
     for entry in raw:
         name = str(entry).strip()
         if not CATEGORY.fullmatch(name):
             raise SettingsError(
-                f"{name!r} in {path()} is not an arXiv category "
+                f"{name!r} in {where} is not an arXiv category "
                 "(expected something like math.AG or hep-th).")
         if name not in out:
             out.append(name)
     if not out:
-        raise SettingsError(f'"categories" in {path()} lists nothing.')
+        raise SettingsError(f'"categories" in {where} lists nothing.')
     return out
+
+
+def parse_categories(text: str) -> list:
+    """Categories as someone types them -- separated by spaces or commas --
+    checked and de-duplicated. Empty means the defaults. Raises ValueError
+    naming whatever is not a category, for the prompt or page to show."""
+    names = text.replace(",", " ").split() or list(DEFAULT_CATEGORIES)
+    wrong = [n for n in names if not CATEGORY.fullmatch(n)]
+    if wrong:
+        raise ValueError(f"Not an arXiv category: {', '.join(wrong)}")
+    return list(dict.fromkeys(names))
 
 
 def categories() -> list:
@@ -169,25 +181,29 @@ def index_dir() -> Path:
     return _home()
 
 
-def embedding(default: dict) -> dict:
+def embedding(default: dict, data: dict = None, where=None) -> dict:
     """The embedding model and how to prompt it, over `default`.
 
     A model other than the default needs its dimension stated: it cannot be
     guessed, and asking Ollama here would make importing the package depend on
     it running. Its prefixes default to none, since the default's are Qwen3's
     and mean nothing to another model -- each model's card says what it wants.
+
+    `data` checks another settings file's contents instead, an export's, with
+    `where` naming it in any complaint.
     """
-    raw = get("embedding")
+    where = where or path()
+    raw = (load() if data is None else data).get("embedding")
     if raw is None:
         return dict(default)
     if not isinstance(raw, dict):
         raise SettingsError(
-            f'"embedding" in {path()} must be an object, e.g. '
+            f'"embedding" in {where} must be an object, e.g. '
             '{"model": "nomic-embed-text", "dim": 768}.')
 
     model = raw.get("model", default["model"])
     if not isinstance(model, str) or not model.strip():
-        raise SettingsError(f'"embedding.model" in {path()} must name a model.')
+        raise SettingsError(f'"embedding.model" in {where} must name a model.')
     model = model.strip()
     same = model == default["model"]
     out = dict(default) if same else {"model": model, "query_prefix": "",
@@ -197,17 +213,17 @@ def embedding(default: dict) -> dict:
         dim = raw["dim"]
         if isinstance(dim, bool) or not isinstance(dim, int) or dim <= 0:
             raise SettingsError(
-                f'"embedding.dim" in {path()} must be a positive whole number.')
+                f'"embedding.dim" in {where} must be a positive whole number.')
         out["dim"] = dim
     elif not same:
         raise SettingsError(
-            f'"embedding" in {path()} names {model!r} but not its "dim". '
+            f'"embedding" in {where} names {model!r} but not its "dim". '
             f'`ollama show {model}` gives it as the embedding length.')
 
     for key in ("query_prefix", "document_prefix"):
         if key in raw:
             if not isinstance(raw[key], str):
-                raise SettingsError(f'"embedding.{key}" in {path()} must be text.')
+                raise SettingsError(f'"embedding.{key}" in {where} must be text.')
             out[key] = raw[key]
     return out
 

@@ -20,6 +20,7 @@ Binds to localhost only: the server exposes the index and, indirectly, Ollama.
 import collections
 import datetime as dt
 import html
+import ipaddress
 import json
 import mimetypes
 import os
@@ -35,7 +36,7 @@ import numpy as np
 
 from . import (cite, config, ingest, profile as profile_mod,
                schedule as schedule_mod, search as search_mod, settings,
-               store, textnorm, update as update_mod)
+               store, textnorm, transfer, update as update_mod)
 
 # Vendored KaTeX (js, css, woff2 subset). Kept local rather than pulled from a
 # CDN so the UI still works offline and does not phone home.
@@ -200,6 +201,14 @@ class ResidentIndex:
         self.meta_cats = cats
         self.meta_authors = authors
         self.meta_loaded = len(ids)
+
+    def set_categories(self, categories) -> None:
+        """Switch to other categories: on setting up, or on taking up an
+        export's settings. The category masks are rebuilt with the matrix."""
+        with self._db_lock:
+            self.categories = list(categories)
+            self._read_holdings()
+            self.reload()
 
     def _read_holdings(self) -> None:
         """Which categories the index holds, as they bear on the reader's."""
@@ -576,7 +585,11 @@ class ResidentIndex:
 class Updater:
     """Runs `update` in the background, for the UI's "Fetch new papers" button,
     or just the embedding, for its "Embed them now" (papers imported with
-    `build --scan-only` and not embedded yet).
+    `build --scan-only` and not embedded yet), or an import uploaded from the
+    settings panel: the arXiv snapshot, or an exported index.
+
+    An import reads its upload off the request that carries it, which has to
+    stay open until then; see _Upload.
 
     A top-up walks the arXiv API and then embeds what came back. A week's
     worth is three or four pages and about a minute all told, most of it
@@ -596,11 +609,15 @@ class Updater:
 
     KEEP_LINES = 200        # a normal run prints a handful; a backlog, more
 
-    def __init__(self):
+    def __init__(self, index=None):
+        self._index = index         # told of categories an import brings
         self._lock = threading.Lock()
         self._thread = None
         self.state = "idle"         # idle | running | done | failed
-        self.kind = "update"        # update | embed
+        self.kind = "update"        # update | embed | snapshot | index
+        self.upload = None          # an import's _Upload
+        self.imported = 0           # papers in scope, once a snapshot is read
+        self.matched = 0            # the same, so far, while it is read
         self.lines = collections.deque(maxlen=self.KEEP_LINES)
         self.started = None
         self.finished = None
@@ -622,16 +639,23 @@ class Updater:
         """
         return self.state == "running" and self._alive()
 
-    def start(self, kind: str = "update") -> bool:
+    def start(self, kind: str = "update", upload=None, embed=True,
+              mode="merge", categories=(), take_settings=False) -> bool:
         """Kick off a run. False if one is already going.
 
-        One at a time whatever the kind: both embed, and two embedding runs
-        would only have the second refused by the embed lock.
+        One at a time whatever the kind: they all write to the index, and two
+        embedding runs would only have the second refused by the embed lock.
+        A snapshot import scans for `categories` and embeds afterwards if
+        `embed`; an index import merges or replaces as `mode` says.
         """
         with self._lock:
             if self._in_flight():
                 return False
             self.state, self.kind = "running", kind
+            self.upload, self._embed, self._mode = upload, embed, mode
+            self._categories = list(categories)
+            self._take_settings = take_settings
+            self.imported = self.matched = 0
             self.lines.clear()
             self.started = time.time()
             self.finished = None
@@ -660,14 +684,20 @@ class Updater:
     def _run(self) -> None:
         db = None
         try:
-            db = store.connect()
-            if self.kind == "embed":
-                store.check_model(db)
-                embedded = ingest.embed_pending(db, log=self._log,
-                                                progress=self._progress)
+            if self.kind == "index":
+                # Its own connections: a replaced index must not be held open.
+                embedded = self._import_index()
             else:
-                embedded = update_mod.update(db, log=self._log,
-                                             progress=self._progress)
+                db = store.connect()
+                store.check_model(db)
+                if self.kind == "snapshot":
+                    embedded = self._import_snapshot(db)
+                elif self.kind == "embed":
+                    embedded = ingest.embed_pending(db, log=self._log,
+                                                    progress=self._progress)
+                else:
+                    embedded = update_mod.update(db, log=self._log,
+                                                 progress=self._progress)
         except (Exception, SystemExit) as exc:  # noqa: BLE001
             # SystemExit deliberately included: the embed lock, the model check
             # and the Ollama probe all raise it to end a CLI run, and none of
@@ -682,8 +712,39 @@ class Updater:
                 self.state, self.embedded = "done", embedded
                 self.finished, self.progress = time.time(), None
         finally:
+            if self.upload is not None:
+                # Whatever happened, the request carrying it can now answer.
+                self.upload.finished()
             if db is not None:
                 db.close()
+
+    def _import_snapshot(self, db) -> int:
+        """Scan the uploaded snapshot for the reader's categories not held yet,
+        then embed if asked. Returns the count embedded."""
+        imported = ingest.scan_lines(
+            db, self._categories, self.upload, self.upload.name,
+            log=self._log, progress=self._matched)
+        with self._lock:
+            self.imported = imported
+        self.upload.finished()
+        if not self._embed:
+            return 0
+        return ingest.embed_pending(db, log=self._log, progress=self._progress)
+
+    def _import_index(self) -> int:
+        took = transfer.import_stream(
+            self.upload, self.upload.name, replace=self._mode == "replace",
+            merge=self._mode == "merge", take_settings=self._take_settings,
+            log=self._log, on_read=self.upload.finished)
+        if took and self._index is not None:
+            # The categories are the one setting the server fixes at start;
+            # the rest are read afresh wherever they are used.
+            self._index.set_categories(settings.categories())
+        return 0
+
+    def _matched(self, matched: int) -> None:
+        with self._lock:
+            self.matched = matched
 
     def snapshot(self) -> dict:
         with self._lock:
@@ -699,6 +760,7 @@ class Updater:
                 "kind": self.kind,
                 "lines": list(self.lines),
                 "embedded": self.embedded,
+                "imported": self.imported,
                 "error": self.error,
             }
             if self.started:
@@ -707,7 +769,71 @@ class Updater:
             if state == "running" and self.progress:
                 done, total = self.progress
                 payload["progress"] = {"done": done, "total": total}
+            elif (state == "running" and self.upload is not None
+                    and not self.upload.done.is_set()):
+                payload["read"] = {"done": self.upload.read_bytes,
+                                   "total": self.upload.total,
+                                   "matched": self.matched}
         return payload
+
+
+class _Upload:
+    """An import's file as it arrives in a request body.
+
+    Read straight off the socket and never held whole: a snapshot is 5.5 GB.
+    Serves both readers -- line by line for the snapshot scan, `read(n)` for
+    tarfile's stream mode -- and never reads past the body. A connection that
+    closes early raises rather than ending the file, so neither reader can
+    mistake half an upload for all of it.
+
+    `done` is set once the upload is no longer being read, which is when the
+    request can answer: until then its body is still in the socket.
+    """
+
+    LINE_CAP = 1 << 24      # a snapshot line is a few KB; this is a backstop
+
+    def __init__(self, rfile, length: int, name: str):
+        self.rfile, self.total, self.name = rfile, length, name
+        self.read_bytes = 0
+        self.done = threading.Event()
+
+    def _short(self):
+        return ConnectionError(f"the upload stopped after {self.read_bytes:,} "
+                               f"of {self.total:,} bytes")
+
+    def read(self, size: int = -1) -> bytes:
+        left = self.total - self.read_bytes
+        if size < 0 or size > left:
+            size = left
+        if not size:
+            return b""
+        data = self.rfile.read(size)
+        if not data:
+            raise self._short()
+        self.read_bytes += len(data)
+        return data
+
+    def __iter__(self):
+        while self.read_bytes < self.total:
+            line = self.rfile.readline(
+                min(self.total - self.read_bytes, self.LINE_CAP))
+            if not line:
+                raise self._short()
+            self.read_bytes += len(line)
+            yield line.decode("utf-8")
+
+    def finished(self) -> None:
+        """The reader is done with it. What little is left (a tar's closing
+        padding) is read off, so the request can answer on a clean socket."""
+        if self.done.is_set():
+            return
+        try:
+            if self.total - self.read_bytes <= transfer.RECORD:
+                while self.read(1 << 16):
+                    pass
+        except OSError:
+            pass
+        self.done.set()
 
 
 class Scheduler:
@@ -840,6 +966,90 @@ def make_handler(index: ResidentIndex, updater: Updater,
         def log_message(self, fmt, *args):  # quieter than the default
             pass
 
+        def _local(self) -> bool:
+            """Whether the page was opened on this machine. Importing and
+            exporting move files between the browser and the index, which is
+            only offered there."""
+            try:
+                return ipaddress.ip_address(self.client_address[0]).is_loopback
+            except ValueError:
+                return False
+
+        def _trusted(self) -> bool:
+            """On this machine, and not a request from another site open in
+            the same browser: a cross-site request carries its Origin."""
+            origin = self.headers.get("Origin")
+            return self._local() and (
+                not origin or urlparse(origin).netloc == self.headers.get("Host"))
+
+        def _receive(self, kind: str, query) -> None:
+            """Take an uploaded import and start it, answering once the upload
+            has been read. What follows -- the embedding, a merge -- carries on
+            in the background, watched through GET /api/update."""
+            # The body may be left unread (a refusal, a failed run); the
+            # connection cannot be reused after that.
+            self.close_connection = True
+            if not self._trusted():
+                self._json({"error": "Importing is only offered on the "
+                                     "machine running the server."}, 403)
+                return
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                length = 0
+            if length <= 0:
+                self._json({"error": "No file was sent."}, 411)
+                return
+            if kind == "snapshot":
+                index.refresh_if_stale()
+                if not index.missing:
+                    self._json({"error": "The index already holds all your "
+                                         "categories, so there is nothing to "
+                                         "import from the snapshot."}, 409)
+                    return
+            name = (query.get("name") or ["the upload"])[0]
+            upload = _Upload(self.rfile, length, name)
+            # The server's own categories, not the settings file's: they
+            # are what its searches and checkboxes know.
+            if not updater.start(kind, upload=upload,
+                                 embed=query.get("embed") == ["1"],
+                                 mode=(query.get("mode") or ["merge"])[0],
+                                 categories=index.missing,
+                                 take_settings=query.get("settings") == ["1"]):
+                self._json(updater.snapshot() |
+                           {"error": "An update is already running."}, 409)
+                return
+            upload.done.wait()
+            self._json(updater.snapshot())
+
+        def _export(self) -> None:
+            """Stream the index out as an export, the same file `export` writes."""
+            if not self._trusted():
+                self._json({"error": "Exporting is only offered on the "
+                                     "machine running the server."}, 403)
+                return
+            query = parse_qs(urlparse(self.path).query)
+            try:
+                with transfer.exporting(query.get("settings") == ["1"]) as ex:
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/x-tar")
+                    self.send_header("Content-Length", str(ex.size))
+                    self.send_header(
+                        "Content-Disposition", "attachment; filename="
+                        f'"arxiv-index-{dt.date.today().isoformat()}.tar"')
+                    self.send_header("Cache-Control", "no-store")
+                    self.end_headers()
+                    try:
+                        ex.write(self.wfile)
+                    except OSError:
+                        # The download was cancelled; nothing to clean up
+                        # beyond what exporting() does.
+                        self.close_connection = True
+            except SystemExit as exc:
+                # No index, or an embedding run holds the lock. Raised before
+                # the headers, so it can still be answered.
+                self._json({"error": str(exc)}, 409)
+
         def _send(self, body: bytes, content_type: str, status: int = 200,
                   no_store: bool = False):
             self.send_response(status)
@@ -891,6 +1101,12 @@ def make_handler(index: ResidentIndex, updater: Updater,
         def do_POST(self):
             self.server.request_started()
             try:
+                # Uploads first, before the body is read: it is the file.
+                target = urlparse(self.path)
+                if target.path in ("/api/import/snapshot", "/api/import/index"):
+                    self._receive(target.path.rsplit("/", 1)[1],
+                                  parse_qs(target.query))
+                    return
                 # The body is always read, even where it is not wanted:
                 # leaving it in the socket desynchronises the keep-alive
                 # connection. Capped so a stray upload cannot be buffered whole.
@@ -911,6 +1127,31 @@ def make_handler(index: ResidentIndex, updater: Updater,
                 if body is not None and not isinstance(body, dict):
                     body = None
                 path = urlparse(self.path).path
+                if path == "/api/setup/categories":
+                    if not self._trusted():
+                        self._json({"error": "Setting up is only offered on "
+                                             "the machine running the server."},
+                                   403)
+                        return
+                    try:
+                        chosen = settings.parse_categories(
+                            str((body or {}).get("categories", "")))
+                    except ValueError as exc:
+                        self._json({"error": str(exc)}, 400)
+                        return
+                    if index.stats()["papers"] and chosen != index.categories:
+                        # The masks the page filters with are built per
+                        # category at start; see ResidentIndex.categories. The
+                        # same list again is fine: a retry after a failed import.
+                        self._json({"error": "The index already has papers; "
+                                             "change the categories in the "
+                                             "settings file and restart."}, 409)
+                        return
+                    settings.update(categories=chosen)
+                    index.set_categories(chosen)
+                    self._json({"categories": chosen})
+                    return
+
                 if path == "/api/profile":
                     if body is None:
                         self._json({"error": "expected a JSON body"}, 400)
@@ -1023,9 +1264,18 @@ def make_handler(index: ResidentIndex, updater: Updater,
                 # changes whenever the server is edited and restarted -- a
                 # browser holding yesterday's copy would silently hide new UI.
                 # (The vendored assets under /static are immutable and are
-                # cached aggressively instead.)
-                self._send(page(index.categories).encode("utf-8"),
-                           "text/html; charset=utf-8", no_store=True)
+                # cached aggressively instead.) An index with no papers yet
+                # gets the setup page instead: there is nothing to search.
+                body = (SETUP_PAGE if index.stats()["papers"] == 0
+                        else page(index.categories))
+                self._send(body.encode("utf-8"), "text/html; charset=utf-8",
+                           no_store=True)
+                return
+
+            if parsed.path == "/api/setup":
+                self._json({"categories": index.categories,
+                            "local": self._local(),
+                            "papers": index.stats()["papers"]})
                 return
 
             if parsed.path.startswith("/static/"):
@@ -1033,7 +1283,11 @@ def make_handler(index: ResidentIndex, updater: Updater,
                 return
 
             if parsed.path == "/api/stats":
-                self._json(index.stats())
+                self._json(index.stats() | {"local": self._local()})
+                return
+
+            if parsed.path == "/api/export":
+                self._export()
                 return
 
             if parsed.path == "/api/update":
@@ -1242,7 +1496,7 @@ def serve(port: int = 8000, host: str = "127.0.0.1", open_browser: bool = True):
     print(f"{stats['embedded']:,} papers resident ({size:,.0f} MB in {where})"
           + (f", {stats['pending']:,} still embedding" if stats["pending"] else ""))
 
-    updater = Updater()
+    updater = Updater(index)
     scheduler = Scheduler(index, updater)
     server = GracefulHTTPServer((host, port),
                                 make_handler(index, updater, scheduler))
@@ -1298,30 +1552,7 @@ PAGE = r"""<!doctype html>
 <title>arXiv index</title>
 <link rel="stylesheet" href="/static/katex.min.css">
 <style>
-:root {
-  --bg: #fbfbfa; --panel: #fff; --ink: #1a1a1a; --muted: #6b6b6b;
-  --line: #e3e3e0; --accent: #13396b; --accent-soft: #dde7f4; --shadow: rgba(0,0,0,.06);
-  --warn: #a5251b;
-  /* Two blues, because the accent has two jobs. --accent is drawn *on* the
-     page (the cog, ghost labels, focus rings) and has to carry against the
-     background; --accent-fill is the filled button, and has to carry white
-     text. On a light page one blue does both; on a dark one they part ways. */
-  --accent-fill: #13396b;
-  --accent-hover: #0c2749;
-  /* A lift on the dark accent, for a glyph that has to be found rather
-     than read. */
-  --accent-bright: #1f5ba8;
-}
-@media (prefers-color-scheme: dark) {
-  :root {
-    --bg: #16161a; --panel: #1e1e23; --ink: #ececf0; --muted: #9a9aa4;
-    --line: #2e2e36; --accent: #5b95d8; --accent-soft: #172030; --shadow: rgba(0,0,0,.3);
-    --warn: #f0847c;
-    --accent-fill: #1d4f8a;
-    --accent-hover: #163d6b;
-    --accent-bright: #7fb4f0;
-  }
-}
+/*THEME*/
 * { box-sizing: border-box; }
 body {
   margin: 0; background: var(--bg); color: var(--ink);
@@ -1496,6 +1727,20 @@ button.cog[aria-expanded="true"] {
 }
 .urow input[type=number] { width: 66px; text-align: center; }
 #s-every[hidden], #s-at[hidden] { display: none; }
+#data[hidden] { display: none; }
+.drow { display: flex; gap: 9px; align-items: center; flex-wrap: wrap;
+        padding-top: 5px; }
+.dlabel { width: 110px; flex: none; color: var(--ink); }
+/* #settings label stacks a caption over its field; these are inline. */
+#settings .drow label { flex-direction: row; align-items: center; gap: 5px; }
+.drow input[type=file] { font: inherit; font-size: 13px; color: var(--muted);
+                         max-width: 280px; }
+.drow select {
+  font: inherit; font-size: 13px; padding: 4px 6px; border: 1px solid var(--line);
+  border-radius: 6px; background: var(--bg); color: var(--ink);
+}
+.dnote { font-size: 12px; color: var(--muted); }
+.dnote a { color: var(--accent); }
 #s-next { color: var(--muted); }
 .opts {
   display: flex; gap: 16px; align-items: center; flex-wrap: wrap;
@@ -1653,6 +1898,37 @@ counts in full, which favours papers near the middle of all of them.">
                 title="Walk the arXiv API back to where the last run stopped, then embed whatever is new">Fetch new papers</button>
       </div>
     </div>
+    <div class="sfield" id="data" hidden>
+      <b>Import and export</b>
+      <span>Files go straight between this browser and the index, so this is
+        only offered on the machine running the server.</span>
+      <div class="drow">
+        <span class="dlabel">arXiv snapshot</span>
+        <input type="file" id="d-snap" accept=".json,application/json">
+        <label><input type="checkbox" id="d-embed" checked> embed afterwards</label>
+        <span class="grow"></span>
+        <button type="button" id="d-snap-go" class="ghost" disabled>Import papers</button>
+      </div>
+      <span class="dnote" id="d-snap-note"></span>
+      <div class="drow">
+        <span class="dlabel">Exported index</span>
+        <input type="file" id="d-index" accept=".tar,application/x-tar">
+        <select id="d-mode">
+          <option value="merge">merge into this index</option>
+          <option value="replace">replace this index</option>
+        </select>
+        <label title="Its categories, followed authors, interests and schedule, in place of yours, which are kept as config.json.bak"><input type="checkbox" id="d-take"> and its settings</label>
+        <span class="grow"></span>
+        <button type="button" id="d-index-go" class="ghost" disabled>Import index</button>
+      </div>
+      <div class="drow">
+        <span class="dlabel">This index</span>
+        <span class="dnote">its papers and embeddings</span>
+        <label title="Your categories, followed authors, interests and schedule"><input type="checkbox" id="d-with"> with your settings</label>
+        <span class="grow"></span>
+        <button type="button" id="d-export" class="ghost">Export index</button>
+      </div>
+    </div>
   </div>
   <div id="update" hidden></div>
 </div></header>
@@ -1794,7 +2070,8 @@ function note(extra) {
     bits.push(stats.embedded.toLocaleString() + " papers searchable");
     if (stats.missing.length)
       bits.push(stats.missing.join(", ") + " not in the index yet — "
-                + "run build to add");
+                + (stats.local ? "import the arXiv snapshot under ⚙"
+                               : "run build to add"));
     if (stats.pending > 0)
       bits.push(stats.pending.toLocaleString() + (embedding
         ? " still embedding — results improve as it goes"
@@ -1804,6 +2081,7 @@ function note(extra) {
   $("#status-text").textContent = bits.join("  ·  ");
   // Offered only when nothing is running: a fetch embeds what is pending too.
   $("#embed").hidden = !(stats && stats.pending > 0) || running;
+  renderData();
 }
 
 function scoreBadges(p) {
@@ -2241,10 +2519,13 @@ function showUpdate(text, bad) {
 }
 
 function updateState(s) {
+  // While an upload is on its way, the server may not have started the run
+  // yet; an idle answer then is stale, not the end of it.
+  if (uploading && s.state !== "running") return;
   running = s.state === "running";
   embedding = running && (s.kind === "embed" || !!s.progress);
   fetchBtn.disabled = running;
-  fetchBtn.textContent = running && s.kind !== "embed"
+  fetchBtn.textContent = running && s.kind === "update"
     ? "Fetching…" : "Fetch new papers";
   note();
   if (running) watched = true;
@@ -2252,17 +2533,28 @@ function updateState(s) {
   if (running) {
     // Embedding is the long half and reports a count; the walk before it only
     // has its own narration to offer, so show whichever exists.
-    showUpdate(s.progress
+    showUpdate(s.read
+      ? `Reading ${bytes(s.read.done)} of ${bytes(s.read.total)}`
+        + (s.kind === "snapshot"
+           ? ` · ${s.read.matched.toLocaleString()} papers in scope` : "") + "…"
+      : s.progress
       ? `Embedding ${s.progress.done.toLocaleString()} of `
         + `${s.progress.total.toLocaleString()}…`
       : (s.lines.length ? s.lines[s.lines.length - 1].trim() : "Starting…"));
   } else if (!watched) {
     updBox.hidden = true;
   } else if (s.state === "failed") {
-    showUpdate((s.kind === "embed" ? "Embedding" : "Update")
+    showUpdate(({embed: "Embedding", snapshot: "Import", index: "Import"}
+                [s.kind] || "Update")
                + " failed: " + (s.error || "unknown error"), true);
   } else if (s.state === "done") {
-    showUpdate((s.kind === "embed"
+    showUpdate((s.kind === "snapshot"
+      ? `Imported ${s.imported.toLocaleString()} paper(s)` + (s.embedded
+        ? `, embedded ${s.embedded.toLocaleString()}` : ", not embedded yet")
+      : s.kind === "index"
+      ? [s.lines.find(l => /^(Merged|Imported)/.test(l)) || "Index imported",
+         s.lines.find(l => /settings/.test(l))].filter(Boolean).join(" ")
+      : s.kind === "embed"
       ? `Embedded ${s.embedded.toLocaleString()} paper(s)`
       : s.embedded
       ? `Fetched and embedded ${s.embedded.toLocaleString()} paper(s)`
@@ -2319,6 +2611,94 @@ embedBtn.onclick = async () => {
   }
 };
 
+/* ---- Import and export ------------------------------------------------
+   Offered only to a page opened on the server's own machine. An import posts
+   the chosen file as the request body -- the browser streams it from disk --
+   and the server reads it as it arrives, so the request lasts as long as the
+   upload does. Progress comes from polling /api/update meanwhile, as for a
+   fetch; the embedding or merge that follows the upload carries on without
+   the tab. */
+
+const snapIn = $("#d-snap"), snapGo = $("#d-snap-go"),
+      idxIn = $("#d-index"), idxGo = $("#d-index-go"), expGo = $("#d-export");
+let uploading = false;
+
+const bytes = n => n >= 1e9 ? (n / 1e9).toFixed(2) + " GB"
+                            : Math.round(n / 1e6).toLocaleString() + " MB";
+
+function renderData() {
+  const box = $("#data");
+  box.hidden = !(stats && stats.local);
+  if (box.hidden) return;
+  const busy = running || uploading, held = !stats.missing.length;
+  snapIn.disabled = $("#d-embed").disabled = held || busy;
+  snapGo.disabled = held || busy || !snapIn.files.length;
+  $("#d-snap-note").innerHTML = held
+    ? "The index holds all your categories. To add one, list it in your "
+      + "settings file and restart the server."
+    : `Imports ${esc(stats.missing.join(", "))} from Kaggle's `
+      + '<a href="https://www.kaggle.com/datasets/Cornell-University/arxiv" '
+      + 'target="_blank" rel="noopener">arXiv snapshot</a>, unzipped: '
+      + "arxiv-metadata-oai-snapshot.json.";
+  idxIn.disabled = $("#d-mode").disabled = $("#d-take").disabled = busy;
+  idxGo.disabled = busy || !idxIn.files.length;
+  expGo.disabled = busy || !stats.papers;
+}
+snapIn.onchange = idxIn.onchange = renderData;
+
+async function upload(kind, file, params) {
+  uploading = watched = true;
+  renderData();
+  showUpdate(`Sending ${file.name}…`);
+  if (!updTimer) {
+    updTimer = setInterval(pollUpdate, 1500);
+    statsTimer = setInterval(refreshStats, 30000);
+  }
+  const p = new URLSearchParams({name: file.name, ...params});
+  let answer = null;
+  try {
+    const r = await fetch(`/api/import/${kind}?${p}`,
+                          {method: "POST", body: file});
+    answer = await r.json();
+  } catch (e) {
+    answer = {error: e.message};
+  }
+  uploading = false;
+  if (answer.state) {
+    updateState(answer);
+    return;
+  }
+  // Refused before it started, or cut off: the server's own state says
+  // which, and a run that failed explains itself better than the socket.
+  try {
+    const s = await (await fetch("/api/update")).json();
+    if (s.kind === kind && s.state !== "idle") { updateState(s); return; }
+  } catch (e) { /* fall through */ }
+  updateState({state: "idle", lines: []});
+  showUpdate("Import not started: " + answer.error, true);
+}
+
+snapGo.onclick = () => upload("snapshot", snapIn.files[0],
+                              {embed: $("#d-embed").checked ? "1" : "0"});
+
+idxGo.onclick = () => {
+  const mode = $("#d-mode").value;
+  if (mode === "replace" && !confirm(
+      "Replace this index with the export? Papers and categories only this "
+      + "index holds will be gone."))
+    return;
+  upload("index", idxIn.files[0],
+         {mode, settings: $("#d-take").checked ? "1" : "0"});
+};
+
+expGo.onclick = () => {
+  // A plain download: the server names the file and states its size.
+  const a = document.createElement("a");
+  a.href = "/api/export" + ($("#d-with").checked ? "?settings=1" : "");
+  a.download = "";
+  a.click();
+};
+
 pollUpdate();
 
 function similar(id, title) {
@@ -2335,4 +2715,347 @@ def page(categories) -> str:
     boxes = "\n".join(
         f'    <label><input type="checkbox" class="cat" value="{c}"> '
         f"{c}</label>" for c in map(html.escape, categories))
-    return PAGE.replace("<!--CATEGORIES-->", boxes)
+    return (PAGE.replace("/*THEME*/", THEME)
+            .replace("<!--CATEGORIES-->", boxes))
+
+
+# The colour tokens both pages are drawn with, light and dark.
+THEME = """:root {
+  --bg: #fbfbfa; --panel: #fff; --ink: #1a1a1a; --muted: #6b6b6b;
+  --line: #e3e3e0; --accent: #13396b; --accent-soft: #dde7f4; --shadow: rgba(0,0,0,.06);
+  --warn: #a5251b;
+  /* Two blues, because the accent has two jobs. --accent is drawn *on* the
+     page (the cog, ghost labels, focus rings) and has to carry against the
+     background; --accent-fill is the filled button, and has to carry white
+     text. On a light page one blue does both; on a dark one they part ways. */
+  --accent-fill: #13396b;
+  --accent-hover: #0c2749;
+  /* A lift on the dark accent, for a glyph that has to be found rather
+     than read. */
+  --accent-bright: #1f5ba8;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #16161a; --panel: #1e1e23; --ink: #ececf0; --muted: #9a9aa4;
+    --line: #2e2e36; --accent: #5b95d8; --accent-soft: #172030; --shadow: rgba(0,0,0,.3);
+    --warn: #f0847c;
+    --accent-fill: #1d4f8a;
+    --accent-hover: #163d6b;
+    --accent-bright: #7fb4f0;
+    /* So the browser draws its own controls -- checkboxes, file pickers,
+       date fields -- dark as well, rather than as white boxes. */
+    color-scheme: dark;
+  }
+}
+"""
+
+
+# What `/` serves while the index holds no papers: choose the categories, then
+# fill the index from the arXiv snapshot or from another instance's export.
+# Both imports are the settings panel's, driven the same way (see the "Import
+# and export" section of PAGE); this page only walks through them in order.
+SETUP_PAGE = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>arXiv index · setup</title>
+<style>
+/*THEME*/
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--bg); color: var(--ink);
+  font: 16px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+}
+.wrap { max-width: 760px; margin: 0 auto; padding: 28px 20px 60px; }
+h1 { font-size: 20px; font-weight: 600; margin: 0 0 6px; }
+h1 span { color: var(--muted); font-weight: 400; }
+h2 { font-size: 15.5px; font-weight: 600; margin: 0 0 4px; }
+a { color: var(--accent); }
+code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .9em; }
+.lead { color: var(--muted); font-size: 14.5px; margin: 0 0 12px; }
+.step {
+  background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+  padding: 18px 20px; margin: 16px 0; box-shadow: 0 1px 3px var(--shadow);
+}
+.step[hidden], .choice[hidden], #p-done[hidden] { display: none; }
+input[type=text] {
+  width: 100%; padding: 10px 13px; font: inherit; font-size: 16px;
+  border: 1px solid var(--line); border-radius: 7px; background: var(--bg);
+  color: var(--ink);
+}
+input[type=text]:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+.choices { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+@media (max-width: 640px) { .choices { grid-template-columns: 1fr; } }
+.choice {
+  display: flex; flex-direction: column; gap: 10px;
+  border: 1px solid var(--line); border-radius: 8px; padding: 14px 16px;
+}
+.choice b { font-size: 14.5px; }
+.choice ol { margin: 0; padding-left: 18px; font-size: 13.5px; color: var(--muted); }
+.choice ol li { margin: 2px 0; }
+.hint { font-size: 12.5px; color: var(--muted); }
+.grow { flex: 1 1 auto; }
+input[type=file] { font: inherit; font-size: 13px; color: var(--muted); max-width: 100%; }
+label.check { display: flex; gap: 7px; align-items: center; font-size: 13.5px; }
+button {
+  align-self: flex-start; padding: 8px 18px; font: inherit; font-size: 15px;
+  font-weight: 500; border: 0; border-radius: 7px; cursor: pointer;
+  background: var(--accent-fill); color: #fff;
+}
+button:hover:not(:disabled) { background: var(--accent-hover); }
+button:disabled { opacity: .45; cursor: default; }
+.bar { height: 6px; border-radius: 3px; background: var(--line); overflow: hidden;
+       margin: 10px 0 8px; }
+.bar i { display: block; height: 100%; width: 0; background: var(--accent-fill);
+         transition: width .4s ease; }
+.err { color: var(--warn); font-size: 13.5px; min-height: 0; }
+.err:not(:empty) { margin-top: 8px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>arXiv index <span>· first-time setup</span></h1>
+  <p class="lead">The index is empty. Choose the arXiv categories it should
+    cover, then fill it: from arXiv's own metadata, or from an index exported
+    by another instance.</p>
+
+  <section class="step" id="remote" hidden>
+    <h2>Open this page on the machine running the server</h2>
+    <p class="lead">Setting up moves large files between your browser and the
+      index, so it is only offered there. On that machine, open the address
+      <code>serve</code> printed, usually <code>http://127.0.0.1:8000/</code>.</p>
+  </section>
+
+  <section class="step" id="s1">
+    <h2>1. Categories</h2>
+    <p class="lead">Their full arXiv names, separated by spaces or commas, such
+      as <code>math.AG hep-th cs.LG</code>
+      (<a href="https://arxiv.org/category_taxonomy" target="_blank"
+      rel="noopener">the list</a>). A paper is included if any of its
+      categories is one of these. More categories take longer to embed.</p>
+    <input type="text" id="cats" spellcheck="false" autocomplete="off"
+           aria-label="Categories">
+    <div class="err" id="cats-err"></div>
+  </section>
+
+  <section class="step" id="s2">
+    <h2>2. Fill the index</h2>
+    <div class="choices">
+      <div class="choice">
+        <b>From arXiv's snapshot</b>
+        <ol>
+          <li>Download the <a href="https://www.kaggle.com/datasets/Cornell-University/arxiv"
+            target="_blank" rel="noopener">arXiv dataset</a> from Kaggle
+            (a free account is needed).</li>
+          <li>Unzip it, and choose
+            <code>arxiv-metadata-oai-snapshot.json</code> (about 5.5 GB).</li>
+        </ol>
+        <input type="file" id="snap" accept=".json,application/json"
+               aria-label="arXiv snapshot">
+        <label class="check"><input type="checkbox" id="embed" checked>
+          Embed the papers straight away</label>
+        <span class="hint">Embedding is the long part: about three hours for
+          three categories on a consumer GPU. It runs on the server, and search
+          works as it goes.</span>
+        <span class="grow"></span>
+        <button type="button" id="snap-go" disabled>Import</button>
+      </div>
+      <div class="choice">
+        <b>From another instance</b>
+        <ol>
+          <li>There, use <b>Export index</b> under ⚙, or run
+            <code>python3 -m arxiv_index export</code>.</li>
+          <li>Choose the <code>.tar</code> file it made.</li>
+        </ol>
+        <input type="file" id="tar" accept=".tar,application/x-tar"
+               aria-label="Exported index">
+        <label class="check"><input type="checkbox" id="take" checked>
+          Use its settings too, if it has them</label>
+        <span class="hint">The embeddings come with it, so it is searchable at
+          once. It must have been built with the embedding model your settings
+          name, by default <code>qwen3-embedding:4b</code>. Its settings, if it
+          was exported with them, bring its categories, followed authors and
+          interests in place of the categories above.</span>
+        <span class="grow"></span>
+        <button type="button" id="tar-go" disabled>Import</button>
+      </div>
+    </div>
+  </section>
+
+  <section class="step" id="s3" hidden>
+    <h2 id="p-title">Importing</h2>
+    <div class="bar"><i id="p-bar"></i></div>
+    <p class="lead" id="p-text"></p>
+    <div class="err" id="p-err"></div>
+    <div id="p-done" hidden>
+      <p class="lead" id="p-next"></p>
+      <button type="button" id="open">Open the index</button>
+    </div>
+  </section>
+</div>
+<script>
+const $ = s => document.querySelector(s);
+const bytes = n => n >= 1e9 ? (n / 1e9).toFixed(2) + " GB"
+                            : Math.round(n / 1e6).toLocaleString() + " MB";
+const count = n => n.toLocaleString();
+let busy = false, uploading = false, timer = null;
+
+function refresh() {
+  for (const el of ["#cats", "#snap", "#tar", "#embed", "#take"])
+    $(el).disabled = busy;
+  $("#snap-go").disabled = busy || !$("#snap").files.length;
+  $("#tar-go").disabled = busy || !$("#tar").files.length;
+}
+$("#snap").onchange = $("#tar").onchange = refresh;
+
+async function init() {
+  const s = await (await fetch("/api/setup")).json();
+  $("#cats").value = s.categories.join(" ");
+  if (!s.local) {
+    $("#remote").hidden = false;
+    $("#s1").hidden = $("#s2").hidden = true;
+    return;
+  }
+  // A reload in the middle of an import picks the run up, not a second one.
+  const u = await (await fetch("/api/update")).json();
+  if (u.state === "running" && (u.kind === "snapshot" || u.kind === "index"))
+    watch(u.kind);
+}
+
+async function saveCategories() {
+  $("#cats-err").textContent = "";
+  const r = await fetch("/api/setup/categories", {
+    method: "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({categories: $("#cats").value})});
+  const s = await r.json();
+  if (!r.ok) {
+    $("#cats-err").textContent = s.error;
+    $("#cats").focus();
+    return false;
+  }
+  $("#cats").value = s.categories.join(" ");
+  return true;
+}
+
+function setBar(fraction) {
+  $("#p-bar").style.width = (100 * Math.max(0, Math.min(1, fraction))) + "%";
+}
+
+function watch(kind) {
+  busy = true;
+  refresh();
+  $("#s3").hidden = false;
+  $("#p-title").textContent = kind === "snapshot"
+    ? "Importing from the snapshot" : "Importing the export";
+  $("#p-err").textContent = "";
+  $("#p-done").hidden = true;
+  if (!timer) timer = setInterval(poll, 1000);
+}
+
+function stop() {
+  clearInterval(timer);
+  timer = null;
+  busy = false;
+  refresh();
+}
+
+async function poll() {
+  try { render(await (await fetch("/api/update")).json()); }
+  catch (e) { /* transient; the next tick asks again */ }
+}
+
+function render(s) {
+  // Until the upload's request has been taken up, an idle answer is stale.
+  if (uploading && s.state !== "running") return;
+  if (s.state === "running") {
+    if (s.read) {
+      setBar(s.read.done / s.read.total);
+      $("#p-text").textContent = `Reading ${bytes(s.read.done)} of `
+        + `${bytes(s.read.total)}`
+        + (s.kind === "snapshot"
+           ? ` · ${count(s.read.matched)} papers in your categories so far` : "")
+        + ". Keep this tab open until the file has been read.";
+    } else if (s.progress) {
+      setBar(s.progress.done / s.progress.total);
+      $("#p-title").textContent = "Embedding";
+      $("#p-text").textContent = `${count(s.progress.done)} of `
+        + `${count(s.progress.total)} papers embedded. This runs on the server:`
+        + " you can close the tab, or open the index and search while it works.";
+      $("#p-next").textContent = `${count(s.imported)} papers imported.`;
+      $("#p-done").hidden = false;
+    } else if (s.lines.length) {
+      $("#p-text").textContent = s.lines[s.lines.length - 1].trim();
+    }
+    return;
+  }
+  stop();
+  if (s.state === "failed") {
+    $("#p-title").textContent = "Import failed";
+    $("#p-err").textContent = s.error || "unknown error";
+    return;
+  }
+  if (s.state !== "done") return;
+  setBar(1);
+  if (s.kind === "snapshot" && !s.imported) {
+    $("#p-title").textContent = "Nothing imported";
+    $("#p-err").textContent = "No papers in your categories were found in "
+      + "that file. Check that it is the arXiv snapshot, and the category names.";
+    return;
+  }
+  $("#p-title").textContent = "Done";
+  if (s.kind === "snapshot") {
+    $("#p-text").textContent = `Imported ${count(s.imported)} papers`
+      + (s.embedded ? ` and embedded ${count(s.embedded)}.` : ".");
+    $("#p-next").textContent = (s.embedded ? "" : "They are not embedded yet: "
+      + "the index page offers to embed them. ")
+      + "The snapshot is a few days or weeks old; Fetch new papers, under ⚙, "
+      + "brings the index up to date.";
+  } else {
+    $("#p-text").textContent = "The export is installed."
+      + (s.lines.some(l => l.startsWith("Took up"))
+         ? " So are its settings." : "");
+    $("#p-next").textContent = "Fetch new papers, under ⚙, brings it up to "
+      + "date with whatever was posted since it was exported.";
+  }
+  $("#p-done").hidden = false;
+}
+
+async function upload(kind, file, params) {
+  if (!(await saveCategories())) return;
+  uploading = true;
+  watch(kind);
+  setBar(0);
+  $("#p-text").textContent = `Sending ${file.name}…`;
+  let answer;
+  try {
+    const r = await fetch(
+      `/api/import/${kind}?` + new URLSearchParams({name: file.name, ...params}),
+      {method: "POST", body: file});
+    answer = await r.json();
+  } catch (e) {
+    answer = {error: e.message};
+  }
+  uploading = false;
+  if (answer.state) { render(answer); return; }
+  // Refused, or cut off: the server's own state says which.
+  try {
+    const s = await (await fetch("/api/update")).json();
+    if (s.kind === kind && s.state !== "idle") { render(s); return; }
+  } catch (e) { /* fall through */ }
+  stop();
+  $("#p-title").textContent = "Import not started";
+  $("#p-err").textContent = answer.error;
+}
+
+$("#snap-go").onclick = () => upload("snapshot", $("#snap").files[0],
+                                     {embed: $("#embed").checked ? "1" : "0"});
+// Nothing to merge into yet, so the export simply becomes the index.
+$("#tar-go").onclick = () => upload("index", $("#tar").files[0],
+  {mode: "replace", settings: $("#take").checked ? "1" : "0"});
+$("#open").onclick = () => { location.href = "/"; };
+init();
+</script>
+</body>
+</html>
+""".replace("/*THEME*/", THEME)

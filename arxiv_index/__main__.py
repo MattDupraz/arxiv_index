@@ -67,12 +67,12 @@ def ask_categories() -> None:
         except (EOFError, KeyboardInterrupt):
             print()
             raise SystemExit(1)
-        names = answer.replace(",", " ").split() or default.split()
-        wrong = [n for n in names if not settings.CATEGORY.fullmatch(n)]
-        if not wrong:
+        try:
+            chosen = settings.parse_categories(answer)
             break
-        print(f"Not an arXiv category: {', '.join(wrong)}. Try again.")
-    settings.update(categories=settings.clean_categories(names))
+        except ValueError as exc:
+            print(f"{exc}. Try again.")
+    settings.update(categories=chosen)
     print(f"Saved to {settings.path()}; edit \"categories\" there to change "
           "them later.\n")
 
@@ -340,7 +340,9 @@ def main(argv=None) -> None:
     p = sub.add_parser("export", help="write the index, embeddings included, "
                                       "to one file")
     p.add_argument("file", type=Path, help="e.g. arxiv-index.tar")
-    p.set_defaults(func=lambda args: transfer.export(args.file))
+    p.add_argument("--settings", action="store_true",
+                   help="include your settings: categories, profile, schedule")
+    p.set_defaults(func=lambda args: transfer.export(args.file, args.settings))
 
     p = sub.add_parser("import", help="install an index written by export, "
                                       "or merge one into this one")
@@ -351,8 +353,12 @@ def main(argv=None) -> None:
                           "the more recent copy of any paper in both")
     how.add_argument("--replace", action="store_true",
                      help="overwrite the index already here")
+    p.add_argument("--settings", action="store_true",
+                   help="also take up the settings it holds, keeping yours "
+                        "as config.json.bak")
     p.set_defaults(func=lambda args: transfer.import_(
-        args.file, replace=args.replace, merge=args.merge))
+        args.file, replace=args.replace, merge=args.merge,
+        take_settings=args.settings))
 
     args = parser.parse_args(argv)
     args.func(args)
