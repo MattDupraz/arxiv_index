@@ -24,9 +24,8 @@ fetch the model, about 2.5 GB:
 ollama pull qwen3-embedding:4b
 ```
 
-To use a different model, pull it too and choose it on the setup page, or see
-[Another embedding model](#another-embedding-model), **before** building: an
-index cannot change model afterwards.
+To use a different model, pull it too; setting up asks which to use. An index
+keeps its model for good.
 
 **2. Install it.** Python 3.11 or newer:
 
@@ -42,46 +41,74 @@ Without it everything works, on the CPU. To work on the code, `pip install -e`
 installs it so that edits take effect without reinstalling; and from the
 repository, `python3 -m arxiv_index` runs it without installing at all.
 
-**The rest can be done in the browser.** Run `arxiv_index serve`
-now: with the index still empty, the page it opens is a first-time setup. It
-asks for your categories and for the embedding model, from those installed in
-Ollama, then fills the index from the arXiv snapshot (step 3 says where to get
-it) and shows the progress. Or it installs an index exported by another
-instance, which brings its own model and categories, and its followed authors
-and interests too if it was exported with its settings. The steps below do the
-same in a terminal.
+**3. Get the papers**, from one of two sources:
 
-If you have an index exported from another machine, skip steps 3 and 4:
-`arxiv_index import arxiv_index.tar` installs it (see
-[Exporting and importing](#exporting-and-importing-an-index)).
+- **arXiv's metadata snapshot**, to build the index yourself. arXiv's API
+  cannot page back far enough to fetch the whole history, so the index is first
+  filled from Kaggle's copy of arXiv's metadata:
+  [kaggle.com/datasets/Cornell-University/arxiv](https://www.kaggle.com/datasets/Cornell-University/arxiv)
+  (a free Kaggle account is needed). Unzip it anywhere; the file inside,
+  `arxiv-metadata-oai-snapshot.json`, is about 5.5 GB. It is needed only to
+  set up and can be deleted afterwards, though adding a category later needs
+  it again.
+- **An index exported by another instance** (see
+  [Exporting and importing](#exporting-and-importing-an-index)), which comes
+  with its embeddings and so skips the hours of embedding.
 
-**3. Download the arXiv snapshot.** arXiv's API cannot page back far enough to
-fetch the whole history, so the index is first filled from Kaggle's copy of
-arXiv's metadata:
-[kaggle.com/datasets/Cornell-University/arxiv](https://www.kaggle.com/datasets/Cornell-University/arxiv)
-(a free Kaggle account is needed), and unzip it anywhere. The file inside,
-`arxiv-metadata-oai-snapshot.json`, is about 5.5 GB. It is needed only for the
-build and can be deleted afterwards, though adding a category later needs it
-again.
+**4. Set up the index**, in the browser or in a terminal.
 
-**4. Build the index**, giving it the snapshot:
+### In the browser
+
+```bash
+arxiv_index serve     # opens http://127.0.0.1:8000/
+```
+
+While the index is empty, the page that opens is a first-time setup:
+
+1. **Categories:** the arXiv categories to cover, by their full names
+   (`math.AG`, `hep-th`, `cs.LG`; see the
+   [list](https://arxiv.org/category_taxonomy)). The default is math.AC,
+   math.AG and math.CO.
+2. **Embedding model:** one of the embedding models installed in Ollama.
+3. **Fill the index:** choose the snapshot, and whether to embed the papers
+   straight away; or choose an export, which brings its own model and
+   categories in place of the two choices above, and its followed authors and
+   interests too if it was exported with its settings.
+
+The page shows the progress. Keep the tab open until the file has been read, a
+minute or two for the snapshot. The embedding that follows runs on the server,
+about three hours for the default three categories on a consumer GPU, and the
+index can be opened and searched while it works. When it is done, **Open the
+index**, then under the cog (top right): **Fetch new papers** brings it up to
+date from the snapshot's date, and the same panel holds the authors you follow,
+your research interests (see [Your profile](#your-profile)) and
+[automatic updates](#automatic-updates).
+
+The setup page is only offered on the machine running `serve`.
+
+### Or in a terminal
+
+From the snapshot:
 
 ```bash
 arxiv_index build ~/Downloads/arxiv-metadata-oai-snapshot.json
+arxiv_index update    # catch up from the snapshot's date to today
+arxiv_index status    # what is in the index, and up to when
+arxiv_index serve
 ```
 
-It first asks which arXiv categories to cover, by their full names (`math.AG`,
-`hep-th`, `cs.LG`; see the [list](https://arxiv.org/category_taxonomy)).
-Pressing Enter takes the default, math.AC, math.AG and math.CO. The answer is
-saved in `~/.arxiv_index/config.json`, where you can change it later (see
-[Adding a category](#adding-a-category)).
+`build` first asks which categories to cover and which embedding model to use,
+from those installed in Ollama. The answers are saved in
+`~/.arxiv_index/config.json`, where the categories can be changed later (see
+[Adding a category](#adding-a-category)). With no one at the terminal it takes
+the defaults.
 
 It then scans the snapshot for those categories, which takes a couple of
-minutes, and embeds every paper. Embedding the default three categories'
-145,000 papers takes about three hours on a consumer GPU, and more categories
-take proportionally longer. It can be interrupted at any time, and
-`arxiv_index build --embed-only` carries on where it stopped. The
-index takes about 6.3 KB of disk per paper, in `~/.arxiv_index/`.
+minutes, and embeds every paper: about three hours for the default three
+categories' 145,000 papers on a consumer GPU, proportionally longer for more.
+It can be interrupted at any time, and `arxiv_index build --embed-only` carries
+on where it stopped. The index takes about 6.3 KB of disk per paper, in
+`~/.arxiv_index/`.
 
 To embed at a better time, say overnight, add `--scan-only`: it imports the
 papers and stops. Embed them later with `build --embed-only`, or with
@@ -90,23 +117,18 @@ embedded. Until then they can be listed by author but not found by searches.
 The next `update` embeds them too, and so does **Fetch new papers**, so either
 of those can start the long run.
 
-**5. Catch up to today.** The snapshot is a few days or weeks old. This fetches
-everything posted since, from the arXiv API:
+From an export, which takes its model and categories from the file:
 
 ```bash
+arxiv_index import arxiv_index.tar    # --settings takes its profile too
 arxiv_index update
-arxiv_index status    # what is in the index, and up to when
+arxiv_index serve
 ```
 
-**6. Start the web UI.**
-
-```bash
-arxiv_index serve     # opens http://127.0.0.1:8000/
-```
-
-Open the settings (the cog, top right) to add the authors you follow and
-describe your research interests (see [Your profile](#your-profile)), and to
-have the index [update itself](#automatic-updates) while the server runs.
+In the web UI, open the settings (the cog, top right) to add the authors you
+follow and describe your research interests (see [Your profile](#your-profile)),
+and to have the index [update itself](#automatic-updates) while the server
+runs.
 
 ## Settings
 
@@ -404,5 +426,6 @@ Deeper background — why search is brute-force, what was tried and abandoned
 | `transfer.py` | exporting and importing an index |
 | `profile.py` | followed authors + weighted interests, each with its own embedding |
 | `schedule.py` | when the server tops itself up |
-| `web.py` | local web UI (stdlib `http.server`) |
+| `web.py` | the web server (stdlib `http.server`) |
+| `static/` | the web pages: `index.html` and `setup.html`, their CSS and JS, and a vendored KaTeX |
 | `__main__.py` | CLI |

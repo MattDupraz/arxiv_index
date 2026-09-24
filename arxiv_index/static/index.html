@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>arXiv index</title>
+<link rel="stylesheet" href="/static/katex.min.css">
+<link rel="stylesheet" href="/static/theme.css">
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<header><div class="wrap">
+  <h1>arXiv index <span id="scope"></span></h1>
+  <form id="f">
+    <input type="search" id="q" placeholder="Describe what you are looking for…"
+           autofocus autocomplete="off">
+    <button type="submit" id="go">Search</button>
+  </form>
+  <div class="opts">
+    <label>Author <input type="text" id="author" placeholder="Noether  ·  Hardy, Littlewood"
+                        title="Several names, comma-separated, match papers they wrote together"
+                        autocomplete="off"></label>
+    <span>Categories:</span>
+    <span id="catboxes"></span>
+    <label title="Show the relevance logit and cosine for each hit">
+      <input type="checkbox" id="showscores"> Scores</label>
+    <span class="dates">
+      <label>Since <input type="date" id="since"></label>
+      <label>Until <input type="date" id="until"></label>
+    </span>
+    <label>Results
+      <select id="k">
+        <option>10</option><option selected>20</option>
+        <option>50</option><option>100</option><option>250</option>
+      </select>
+    </label>
+  </div>
+  <div class="opts acts-bar">
+    <button type="button" id="followed" class="ghost primary"
+            title="Every paper by a followed author in the date range above">Followed authors</button>
+    <button type="button" id="byinterest" class="ghost primary"
+            title="The date range above, ordered by closeness to your research interests">Rank by my interests</button>
+    <span class="grow"></span>
+    <button type="button" id="cog" class="ghost cog" aria-controls="settings"
+            aria-expanded="false"
+            title="Settings — who you follow, what you work on, and when the index tops itself up">⚙</button>
+  </div>
+  <div id="settings" hidden>
+    <label><b>Followed authors</b> one name per line
+      <textarea id="p-authors" rows="6" spellcheck="false"
+                placeholder="Emmy Noether&#10;David Hilbert"></textarea></label>
+    <div class="pfield">
+      <b>Research interests</b>
+      <span>one short description per thing you work on — each is embedded and
+        matched separately, so distinct projects stay distinct instead of
+        averaging into one blur. Weight 0 switches an entry off.</span>
+      <div class="ihead"><span>Weight</span><span>Description</span></div>
+      <div id="p-interests"></div>
+      <button type="button" id="p-add" class="ghost">Add interest</button>
+      <label class="blendrow" title="A paper is scored by its best-matching
+interest, plus a diminishing share of every further match. At 0 only the best
+match counts, so a paper squarely on one project wins. At 1 every interest
+counts in full, which favours papers near the middle of all of them.">
+        Reward for matching several
+        <input type="range" id="p-blend" min="0" max="1" step="0.05">
+        <output id="p-blendout"></output>
+      </label>
+    </div>
+    <div class="pbar">
+      <button type="button" id="p-save">Save</button>
+      <button type="button" id="p-cancel" class="ghost">Cancel</button>
+      <span id="p-note"></span>
+    </div>
+    <div class="sfield">
+      <b>Automatic updates</b>
+      <span>the same top-up as the button, on a clock, for as long as this
+        server is running. Times are this machine's local time. A missed run
+        is caught up rather than skipped.</span>
+      <div class="urow">
+        <select id="s-mode">
+          <option value="off">Off</option>
+          <option value="interval">Every</option>
+          <option value="daily">Daily at</option>
+        </select>
+        <span id="s-every" hidden>
+          <input type="number" id="s-hours" min="1" max="168" step="1"> hours
+        </span>
+        <input type="time" id="s-at" hidden>
+        <span id="s-next"></span>
+        <span class="grow"></span>
+        <button type="button" id="fetch" class="ghost"
+                title="Walk the arXiv API back to where the last run stopped, then embed whatever is new">Fetch new papers</button>
+      </div>
+    </div>
+    <div class="sfield" id="data" hidden>
+      <b>Import and export</b>
+      <span>Files go straight between this browser and the index, so this is
+        only offered on the machine running the server.</span>
+      <div class="drow">
+        <span class="dlabel">arXiv snapshot</span>
+        <input type="file" id="d-snap" accept=".json,application/json">
+        <label><input type="checkbox" id="d-embed" checked> embed afterwards</label>
+        <span class="grow"></span>
+        <button type="button" id="d-snap-go" class="ghost" disabled>Import papers</button>
+      </div>
+      <span class="dnote" id="d-snap-note"></span>
+      <div class="drow">
+        <span class="dlabel">Exported index</span>
+        <input type="file" id="d-index" accept=".tar,application/x-tar">
+        <select id="d-mode">
+          <option value="merge">merge into this index</option>
+          <option value="replace">replace this index</option>
+        </select>
+        <label title="Its categories, followed authors, interests and schedule, in place of yours, which are kept as config.json.bak"><input type="checkbox" id="d-take"> and its settings</label>
+        <span class="grow"></span>
+        <button type="button" id="d-index-go" class="ghost" disabled>Import index</button>
+      </div>
+      <div class="drow">
+        <span class="dlabel">This index</span>
+        <span class="dnote">its papers and embeddings</span>
+        <label title="Your categories, followed authors, interests and schedule"><input type="checkbox" id="d-with"> with your settings</label>
+        <span class="grow"></span>
+        <button type="button" id="d-export" class="ghost">Export index</button>
+      </div>
+    </div>
+  </div>
+  <div id="update" hidden></div>
+</div></header>
+
+<div class="wrap">
+  <div id="status"><span id="status-text"></span>
+    <button type="button" id="embed" class="ghost" hidden
+            title="Embed the papers that are in the index but not yet searchable">Embed them now</button></div>
+  <div id="results"></div>
+</div>
+
+<script src="/static/katex.min.js"></script>
+<script src="/static/auto-render.min.js"></script>
+<script src="/static/app.js"></script>
+</body>
+</html>

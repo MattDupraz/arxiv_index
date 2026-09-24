@@ -1,0 +1,28 @@
+/* The colour tokens both pages are drawn with, light and dark. */
+:root {
+  --bg: #fbfbfa; --panel: #fff; --ink: #1a1a1a; --muted: #6b6b6b;
+  --line: #e3e3e0; --accent: #13396b; --accent-soft: #dde7f4; --shadow: rgba(0,0,0,.06);
+  --warn: #a5251b;
+  /* Two blues, because the accent has two jobs. --accent is drawn *on* the
+     page (the cog, ghost labels, focus rings) and has to carry against the
+     background; --accent-fill is the filled button, and has to carry white
+     text. On a light page one blue does both; on a dark one they part ways. */
+  --accent-fill: #13396b;
+  --accent-hover: #0c2749;
+  /* A lift on the dark accent, for a glyph that has to be found rather
+     than read. */
+  --accent-bright: #1f5ba8;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #16161a; --panel: #1e1e23; --ink: #ececf0; --muted: #9a9aa4;
+    --line: #2e2e36; --accent: #5b95d8; --accent-soft: #172030; --shadow: rgba(0,0,0,.3);
+    --warn: #f0847c;
+    --accent-fill: #1d4f8a;
+    --accent-hover: #163d6b;
+    --accent-bright: #7fb4f0;
+    /* So the browser draws its own controls -- checkboxes, file pickers,
+       date fields -- dark as well, rather than as white boxes. */
+    color-scheme: dark;
+  }
+}

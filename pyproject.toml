@@ -27,5 +27,5 @@ packages = ["arxiv_index"]
 version = { attr = "arxiv_index.__version__" }
 
 [tool.setuptools.package-data]
-# The vendored KaTeX the web UI serves, so it works offline.
-arxiv_index = ["static/*.js", "static/*.css", "static/fonts/*"]
+# The web UI: its pages, styles and scripts, and a vendored KaTeX.
+arxiv_index = ["static/*.html", "static/*.js", "static/*.css", "static/fonts/*"]
