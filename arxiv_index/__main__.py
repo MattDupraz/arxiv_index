@@ -247,7 +247,8 @@ def main(argv=None) -> None:
         prog="arxiv_index",
         description="Semantic search over arXiv "
                     f"{', '.join(settings.categories())}. Settings are read "
-                    f"from {settings.path()}, or $ARXIV_INDEX_CONFIG.",
+                    f"from {settings.path()}, beside the index; "
+                    "$ARXIV_INDEX_DIR moves both.",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 

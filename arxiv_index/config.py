@@ -136,7 +136,8 @@ GPU_SEARCH = True
 BATCH_SIZE = 64
 
 # --- Storage ----------------------------------------------------------------
-# Both paths come from the reader's settings, defaulting to the repo root.
+# The index is ~/.arxiv_index or $ARXIV_INDEX_DIR; the snapshot comes from the
+# reader's settings, defaulting to the repo root.
 ROOT = settings.ROOT
 SNAPSHOT = settings.snapshot()
 INDEX_DIR = settings.index_dir()

@@ -1,21 +1,19 @@
 """The reader's own settings, kept in a file of their own.
 
-    ~/.arxiv-index/config.json      ($ARXIV_INDEX_CONFIG overrides)
+    ~/.arxiv_index/config.json      ($ARXIV_INDEX_DIR moves the directory)
 
 The same directory holds the index (papers.db, vectors.f16) and the cache of
 interest embeddings, so everything that is the reader's rather than the code's
-is in one place.
+is in one place, and one variable says where.
 
 `config.py` is how the index is built -- the model, the tuning, the measurements
 behind them -- and is the same for everyone. This file is who is using it: which
 arXiv categories they care about, who they follow, what they work on, when their
-server should top itself up, and where the index lives. Several people can then
-share one index, each with their own file, and copying an index to someone else
-does not hand them your profile.
+server should top itself up. Handing someone papers.db and vectors.f16 does not
+hand them your profile.
 
     {
       "categories": ["math.AC", "math.AG", "math.CO"],
-      "index_dir": "~/.arxiv-index",
       "snapshot": "~/Downloads/arxiv-metadata-oai-snapshot.json",
       "embedding": {"model": "nomic-embed-text", "dim": 768,
                     "query_prefix": "search_query: ",
@@ -31,7 +29,7 @@ Every key is optional. Relative paths are read from the file's own directory.
 JSON rather than TOML because the web UI writes the profile back, and the
 standard library can read TOML but not write it. The file is re-read on every
 use, so a hand edit is picked up without a restart -- except `categories`,
-`embedding` and the two paths, which a running server fixes at start.
+`embedding` and `snapshot`, which a running server fixes at start.
 
 `embedding` is the odd one out: it describes the index rather than the reader.
 Everyone sharing an index has to name the model it was built with, and
@@ -51,8 +49,11 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 
-# Settings, index and cache all live here unless the settings say otherwise.
-HOME = Path.home() / ".arxiv-index"
+
+def _home() -> Path:
+    """Where the index lives, and the settings file unless it is moved."""
+    override = os.environ.get("ARXIV_INDEX_DIR")
+    return Path(override).expanduser() if override else Path.home() / ".arxiv_index"
 
 DEFAULT_CATEGORIES = ("math.AC", "math.AG", "math.CO")
 
@@ -81,14 +82,11 @@ class SettingsError(SystemExit):
 
 
 def path() -> Path:
-    override = os.environ.get("ARXIV_INDEX_CONFIG")
-    if override:
-        return Path(override).expanduser()
-    return HOME / "config.json"
+    return _home() / "config.json"
 
 
 def cache_dir() -> Path:
-    return HOME
+    return _home()
 
 
 def load() -> dict:
@@ -172,7 +170,14 @@ def _path_setting(key: str, default: Path) -> Path:
 
 
 def index_dir() -> Path:
-    return _path_setting("index_dir", HOME)
+    if "index_dir" in load():
+        # Refused rather than ignored, or a file written for an earlier
+        # version would quietly be read against a different index.
+        raise SettingsError(
+            f'"index_dir" in {path()} is no longer read. Remove it; '
+            "$ARXIV_INDEX_DIR moves the directory holding both this file "
+            "and the index.")
+    return _home()
 
 
 def snapshot() -> Path:

@@ -53,15 +53,13 @@ Model weights live in `~/.ollama` (~2.5 GB) and `~/.cache/huggingface`
 
 ## Settings
 
-Everything personal is in one file, beside the index in `~/.arxiv-index/`:
-`~/.arxiv-index/config.json`, or wherever `$ARXIV_INDEX_CONFIG` points.
-Several people can share one index, each with their own file, and handing
-someone a copy of your index does not hand them your profile.
+The index and everything personal live in `~/.arxiv_index/`, or wherever
+`$ARXIV_INDEX_DIR` points. The personal part is one file, `config.json`, so
+handing someone `papers.db` and `vectors.f16` does not hand them your profile.
 
 ```json
 {
   "categories": ["math.AC", "math.AG", "math.CO", "math.NT"],
-  "index_dir": "/data/arxiv/index",
   "snapshot": "~/Downloads/arxiv-metadata-oai-snapshot.json"
 }
 ```
@@ -69,13 +67,12 @@ someone a copy of your index does not hand them your profile.
 | | |
 |---|---|
 | `categories` | the arXiv categories you want, by their full names: `math.AG`, `hep-th`, `cs.LG` ([list](https://arxiv.org/category_taxonomy)). Default: math.AC, math.AG, math.CO |
-| `index_dir` | where the index lives. Default: `~/.arxiv-index` |
 | `snapshot` | where the Kaggle snapshot is. Default: the repo root |
 | `embedding` | the Ollama embedding model. Default: `qwen3-embedding:4b`; see [below](#another-embedding-model) |
 
 Relative paths are read from the settings file's own directory. The profile
 and the automatic-update setting are stored here too, written by the web UI.
-Hand edits are picked up without a restart, except the four keys above, which
+Hand edits are picked up without a restart, except the three keys above, which
 `serve` reads when it starts.
 
 ### Another embedding model
@@ -95,7 +92,7 @@ to none. All the measurements in `config.py` were taken with the default model.
 
 An index is tied to the model that built it. `model`, `dim` and
 `document_prefix` are recorded in it, and anything else is refused, since those
-vectors would not be comparable. To switch models, point `index_dir` at a new
+vectors would not be comparable. To switch models, point `$ARXIV_INDEX_DIR` at a new
 directory and `build` there. `query_prefix` is free to change at any time.
 
 An index from before this file existed moves its profile here the first time
@@ -124,8 +121,8 @@ slot in `vectors.f16`, which has no identity of its own. **Back them up
 together.** If they are separated, the vectors can be rebuilt:
 
 ```bash
-sqlite3 ~/.arxiv-index/papers.db "UPDATE papers SET row = NULL"
-rm ~/.arxiv-index/vectors.f16
+sqlite3 ~/.arxiv_index/papers.db "UPDATE papers SET row = NULL"
+rm ~/.arxiv_index/vectors.f16
 python3 -m arxiv_index build --embed-only
 ```
 
@@ -196,7 +193,7 @@ Descriptions are embedded on save, so changing a weight or the slider embeds
 nothing. If Ollama is unreachable the text is stored anyway and flagged as
 unrankable until you save again. An interest added by editing the settings
 file is embedded the first time you rank. The embeddings are cached in
-`~/.arxiv-index/interest-vectors.json`, which is safe to delete.
+`interest-vectors.json` in the same directory, which is safe to delete.
 
 ### Searching by author
 

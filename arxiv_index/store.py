@@ -105,7 +105,7 @@ def check_model(db: sqlite3.Connection) -> None:
                 f"Index {config.INDEX_DIR} was built with {key} {stored!r}, but "
                 f"the settings in {settings.path()} give {current!r}.\n"
                 "Vectors made differently are not comparable. Either set "
-                '"embedding" back to what built the index, point "index_dir" '
+                '"embedding" back to what built the index, point $ARXIV_INDEX_DIR '
                 "at a new directory, or rebuild this one from scratch."
             )
 
