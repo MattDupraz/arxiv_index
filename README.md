@@ -77,6 +77,9 @@ a GPU.
 - **An index exported by another instance** (see
   [Exporting and importing](#exporting-and-importing-an-index)), which comes
   with its embeddings and so skips the hours of embedding.
+  Feel free to use my computed embeddings for the categories `math.AC`, `math.AG`, `math.CO`:
+  [download link](https://app.filen.io/#/d/27a9dfe5-28fe-469f-80f6-d0e8cf6e69a8%232d66344579636d4a74585a356c4e6e44626956464474746f4f5a6d6b6943534c).
+  *(last updated: 2026-09-24)*
 
 **4. Set up the index**, in the browser or in a terminal.
 
