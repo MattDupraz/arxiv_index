@@ -31,13 +31,12 @@ keeps its model for good.
 
 ```bash
 git clone https://github.com/MattDupraz/arxiv_index.git
-pip install ./arxiv_index          # or ./arxiv_index[gpu], see below
+pip install ./arxiv_index
 ```
 
 This installs the `arxiv_index` command, which works from any directory, and
-the two dependencies, numpy and ollama. The `[gpu]` extra adds torch, which
-only helps with a GPU: it lets the web UI search on the GPU, which is faster.
-Without it everything works, on the CPU. To work on the code, `pip install -e`
+its two dependencies, numpy and ollama. Embedding runs in Ollama, on the GPU if
+Ollama can use one; nothing else needs a GPU. To work on the code, `pip install -e`
 installs it so that edits take effect without reinstalling; and from the
 repository, `python3 -m arxiv_index` runs it without installing at all.
 

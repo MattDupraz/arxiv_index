@@ -16,42 +16,28 @@ recall cliff, no tuning, and nothing to rebuild when papers are appended. Adding
 a paper is appending 5 KB to a file. This is the main reason the index is cheap
 to maintain, and it holds to a few million papers.
 
-`GPU_SEARCH` mirrors the matrix into VRAM: **418 ms → 2.8 ms**, a 149× speed-up
-for 747 MB and a 0.14 s upload whenever the index grows. Server only — a CLI
-search is a fresh process and would pay the torch import to save 0.4 s. It falls
-back to CPU silently if torch or the GPU is unavailable.
-
-The GPU computes in float16 where the CPU promotes to float32, so scores differ
-by ~2e-4 — enough to swap papers that were already tied. In one query two
-abstracts 1.94e-05 apart traded places because both round to exactly 0.719727 in
-float16. Same papers, arbitrary order between two of them. `GPU_SEARCH = False`
-restores bit-identical agreement with the CLI.
+Scoring runs on the CPU: **418 ms** for the 145k papers, next to ~175 ms to
+embed the query. Searching on the GPU was measured at 2.8 ms, and dropped: it
+took torch, ~1.2 GB of server memory and 747 MB of VRAM to save 0.4 s a search.
+It would earn its keep at around a million papers, where the CPU needs seconds;
+the `reranking` branch still has it.
 
 ## What the server holds
 
 Resident set of the `serve` process, measured on the 145k-paper index:
 
-| | RSS | anonymous |
-|---|---|---|
-| CPU search (`GPU_SEARCH = False`) | 840 MB | **98 MB** |
-| GPU search | 1.0 GB | 566 MB |
+| RSS | anonymous |
+|---|---|
+| 840 MB | **98 MB** |
 
-Only the anonymous column is memory the kernel cannot take back. On the CPU path
-the other 742 MB is the vector file mapped in: clean page-cache, evicted under
-pressure and re-read from disk, so the server nominally holding 840 MB does not
-mean 840 MB is unavailable to anything else.
+Only the anonymous column is memory the kernel cannot take back. The other
+742 MB is the vector file mapped in: clean page-cache, evicted under pressure
+and re-read from disk, so the server nominally holding 840 MB does not mean
+840 MB is unavailable to anything else.
 
-Almost everything above 100 MB is torch: ~480 MB to import it and open a HIP
-context, and another ~700 MB the first time a kernel runs, which is ROCm loading
-its kernel libraries and is not returned afterwards. That cost is per-process and
-independent of corpus size. It buys the 149× search speed-up; if that is not
-wanted, `GPU_SEARCH = False` keeps the process under 100 MB of real memory.
+What keeps the rest small had to be built rather than freed, since CPython
+returns very little to the OS once it has grown:
 
-Two things keep the rest small, both of which had to be built rather than freed —
-CPython returns very little to the OS once it has grown:
-
-- **The host copy of the matrix is dropped after the upload to VRAM.** Nothing
-  reads it again while `gpu` is set, and the upload has just paged all 747 MB in.
 - **Per-row metadata is streamed and pooled.** `fetchall()` on 145k rows is ~65 MB
   of `sqlite3.Row` objects that a build re-pays every few seconds, and the rows
   are mostly repetition: 5.2k distinct dates and 4.6k distinct category sets
@@ -70,8 +56,8 @@ Name another model under `"embedding"` in the settings and the index refuses to
 load rather than silently mixing incomparable vectors.
 
 **The query embedding runs on the CPU**: 175 ms against 89 ms on the GPU, in
-exchange for 4.1 GB of VRAM left to the vector matrix and to builds. Indexing
-keeps the GPU at 14.1 docs/s.
+exchange for 4.1 GB of VRAM left to builds and anything else. Indexing keeps
+the GPU at 14.1 docs/s.
 
 `num_gpu` must be stated explicitly on **both** paths. Ollama does not move a
 model back on its own — once loaded with `num_gpu: 0` it stays on the CPU, and a
@@ -89,9 +75,9 @@ papers 3e-3 apart in cosine are ties.
 
 ## Benchmarking
 
-The GPU downclocks when idle, and the first searches after a quiet spell run
-**4× slower** until the clocks ramp. Warm up before timing anything, or you will
-measure power management.
+The GPU downclocks when idle, and the first work after a quiet spell runs
+**4× slower** until the clocks ramp. Warm up before timing embedding, or you
+will measure power management.
 
 ## Two arXiv API traps
 

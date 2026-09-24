@@ -3,10 +3,9 @@
     python -m arxiv_index serve
 
 Runs on the standard library alone. The point of a resident server is that the
-vector matrix is loaded once and stays put -- in VRAM when there is a GPU,
-mapped from the file otherwise -- so a search costs one embedding call plus one
-matrix-vector product, rather than the CLI's re-open of the whole file on every
-invocation.
+vector matrix is mapped once and stays put, so a search costs one embedding
+call plus one matrix-vector product, rather than the CLI's re-open of the whole
+file on every invocation.
 
 Filtering is applied *after* scoring here, unlike the CLI. The CLI pre-filters
 in SQL to avoid touching rows it does not need, but that gathers the matching
@@ -63,8 +62,6 @@ class ResidentIndex:
         self._read_holdings()
         self.ids = []
         self.matrix = None
-        self.gpu = None          # matrix in VRAM, when available
-        self.torch = None
         # Values that repeat across rows, held once. See _shared().
         self._pool = {}
         self._version = self._data_version()
@@ -88,49 +85,12 @@ class ResidentIndex:
         """
         return self._pool.setdefault(value, value)
 
-    def _to_gpu(self) -> None:
-        """Mirror the matrix into VRAM. Falls back silently to the CPU path.
-
-        Re-uploaded on every reload, so the old tensor is dropped first --
-        during a build reload happens often, and leaking 747 MB each time would
-        exhaust VRAM quickly.
-
-        On success the host copy is released. Once the vectors are in VRAM
-        nothing reads them from RAM again, and the upload has just touched every
-        page of the file: keeping the mapping would hold 747 MB resident for a
-        fallback that cannot be taken while `gpu` is set. Dropping it is free --
-        `reload()` re-maps from scratch anyway.
-        """
-        self.gpu = None
-        if not config.GPU_SEARCH or not len(self.ids):
-            return
-        try:
-            import torch
-        except ImportError:
-            return
-        try:
-            if not torch.cuda.is_available():
-                return
-            self.torch = torch
-            torch.cuda.empty_cache()
-            self.gpu = torch.from_numpy(
-                np.ascontiguousarray(self.matrix)).to("cuda")
-        except Exception:  # noqa: BLE001 - VRAM pressure, driver issues, ...
-            self.gpu = None
-        else:
-            self.matrix = None
-
     def score(self, vector):
-        """Cosine against every embedded paper, on the GPU when it is there."""
-        # Snapshot both, matrix first: a reload running in another thread swaps
-        # the pair, and the local reference keeps whichever one this query picks
-        # alive for the duration of the scan.
-        matrix, gpu = self.matrix, self.gpu
-        if gpu is None:
-            return search_mod.score_all(matrix, vector)
-        query = self.torch.from_numpy(np.ascontiguousarray(vector)).to(
-            "cuda").half()
-        return (gpu @ query).float().cpu().numpy()
+        """Cosine against every embedded paper."""
+        # A local reference: a reload in another thread swaps the matrix, and
+        # this keeps the one the query started with alive for the scan.
+        matrix = self.matrix
+        return search_mod.score_all(matrix, vector)
 
     def _rows(self, sql: str, params=()):
         with self._db_lock:
@@ -168,7 +128,6 @@ class ResidentIndex:
         self.authors = authors
         self.cat_masks = {cat: np.array(mask, dtype=bool)
                           for cat, mask in masks.items()}
-        self._to_gpu()
 
     def reload_metadata(self) -> None:
         """Metadata for *every* paper, embedded or not.
@@ -1487,10 +1446,8 @@ def serve(port: int = 8000, host: str = "127.0.0.1", open_browser: bool = True):
     print("Loading index ...")
     index = ResidentIndex()
     stats = index.stats()
-    # Computed rather than read off the matrix, which is gone on the GPU path.
     size = len(index.ids) * config.slot_bytes() / 1e6 if index.ids else 0
-    where = "VRAM" if index.gpu is not None else "RAM"
-    print(f"{stats['embedded']:,} papers resident ({size:,.0f} MB in {where})"
+    print(f"{stats['embedded']:,} papers resident ({size:,.0f} MB mapped)"
           + (f", {stats['pending']:,} still embedding" if stats["pending"] else ""))
 
     updater = Updater(index)

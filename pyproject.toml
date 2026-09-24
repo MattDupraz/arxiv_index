@@ -10,10 +10,6 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = ["numpy", "ollama"]
 
-[project.optional-dependencies]
-# Search on the GPU; see GPU_SEARCH in config.py.
-gpu = ["torch"]
-
 [project.scripts]
 arxiv_index = "arxiv_index.__main__:main"
 

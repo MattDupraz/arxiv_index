@@ -114,7 +114,7 @@ OLLAMA_OPTIONS = {"num_ctx": 2048, "num_batch": 8192, "num_gpu": 99}
 
 # Query embedding runs on the CPU. One short text costs 175ms there against
 # 89ms on the GPU, and it frees the 4.1 GB the embedder would otherwise hold
-# for the vector matrix (GPU_SEARCH) and for a build running alongside.
+# for a build running alongside, or anything else using the GPU.
 #
 # `num_gpu` must be stated explicitly on BOTH paths. Ollama does not move a
 # model back on its own: once loaded with num_gpu=0 it stays on the CPU, and a
@@ -124,14 +124,6 @@ OLLAMA_OPTIONS = {"num_ctx": 2048, "num_batch": 8192, "num_gpu": 99}
 # 7e-3). Measured effect on retrieval: same top-1 and the same top-10 set, only
 # minor reordering within it.
 OLLAMA_QUERY_OPTIONS = {"num_ctx": 2048, "num_batch": 8192, "num_gpu": 0}
-
-# Hold the vector matrix in VRAM and score there. Measured 418ms -> 2.8ms for
-# 145k rows, with the top-10 unchanged (differences ~2.5e-4). Costs 747 MB of
-# VRAM and a 0.14s upload whenever the index grows.
-#
-# Server only. A CLI search is a fresh process, so it would pay the torch import
-# and the upload to save 0.4s -- a net loss. Set False to keep everything on CPU.
-GPU_SEARCH = True
 
 # Docs per ollama.embed() call. Throughput is flat from 64 upward on this GPU
 # (compute-bound, not batching-bound), so 64 keeps checkpoints frequent.
