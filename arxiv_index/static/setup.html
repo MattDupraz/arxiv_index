@@ -10,9 +10,8 @@
 <body>
 <div class="wrap">
   <h1>arXiv index <span>· first-time setup</span></h1>
-  <p class="lead">The index is empty. Choose the arXiv categories it should
-    cover and the model that embeds them, then fill it: from arXiv's own
-    metadata, or from an index exported by another instance.</p>
+  <p class="lead">The index is empty. Build it from arXiv's own metadata, or
+    import one exported by another instance.</p>
 
   <section class="step" id="remote" hidden>
     <h2>Open this page on the machine running the server</h2>
@@ -21,71 +20,84 @@
       <code>serve</code> printed, usually <code>http://127.0.0.1:8000/</code>.</p>
   </section>
 
-  <section class="step" id="s1">
-    <h2>1. Categories</h2>
-    <p class="lead">Their full arXiv names, separated by spaces or commas, such
-      as <code>math.AG hep-th cs.LG</code>
-      (<a href="https://arxiv.org/category_taxonomy" target="_blank"
-      rel="noopener">the list</a>). A paper is included if any of its
-      categories is one of these. More categories take longer to embed.</p>
-    <input type="text" id="cats" spellcheck="false" autocomplete="off"
-           aria-label="Categories">
-    <div class="err" id="cats-err"></div>
-  </section>
-
-  <section class="step" id="s-model">
-    <h2>2. Embedding model</h2>
-    <p class="lead">The model that turns abstracts and searches into vectors,
-      from the ones installed in Ollama. The default,
-      <code>qwen3-embedding:4b</code>, is the one this was tuned with. To use
-      another, <code>ollama pull</code> it and reload this page. An index keeps
-      its model for good.</p>
-    <select id="model" aria-label="Embedding model"></select>
-    <div class="err" id="model-err"></div>
-  </section>
-
-  <section class="step" id="s2">
-    <h2>3. Fill the index</h2>
-    <div class="choices">
-      <div class="choice">
-        <b>From arXiv's snapshot</b>
-        <ol>
-          <li>Download the <a href="https://www.kaggle.com/datasets/Cornell-University/arxiv"
-            target="_blank" rel="noopener">arXiv dataset</a> from Kaggle
-            (a free account is needed).</li>
-          <li>Unzip it, and choose
-            <code>arxiv-metadata-oai-snapshot.json</code> (about 5.5 GB).</li>
-        </ol>
-        <input type="file" id="snap" accept=".json,application/json"
-               aria-label="arXiv snapshot">
-        <label class="check"><input type="checkbox" id="embed" checked>
-          Embed the papers straight away</label>
-        <span class="hint">Embedding is the long part: about three hours for
-          three categories on a consumer GPU. It runs on the server, and search
-          works as it goes.</span>
-        <span class="grow"></span>
-        <button type="button" id="snap-go" disabled>Import</button>
-      </div>
-      <div class="choice">
-        <b>From another instance</b>
-        <ol>
-          <li>There, use <b>Export index</b> under ⚙, or run
-            <code>python3 -m arxiv_index export</code>.</li>
-          <li>Choose the <code>.tar</code> file it made.</li>
-        </ol>
-        <input type="file" id="tar" accept=".tar,application/x-tar"
-               aria-label="Exported index">
-        <label class="check"><input type="checkbox" id="take" checked>
-          Use its settings too, if it has them</label>
-        <span class="hint">The embeddings come with it, so it is searchable at
-          once. Its embedding model and categories come with it too, in place
-          of the choices above; so do its followed authors and interests, if
-          it was exported with its settings.</span>
-        <span class="grow"></span>
-        <button type="button" id="tar-go" disabled>Import</button>
-      </div>
+  <section class="step" id="choose">
+    <h2>How should the index be filled?</h2>
+    <div class="paths">
+      <button type="button" class="path" data-path="build" aria-pressed="false">
+        <b>Build it from arXiv's snapshot</b>
+        <span>Choose the categories and the embedding model, and the papers are
+          embedded here. The embedding takes a few hours.</span>
+      </button>
+      <button type="button" class="path" data-path="import" aria-pressed="false">
+        <b>Import an exported index</b>
+        <span>From another instance, with its embeddings, model and categories:
+          searchable as soon as it is in.</span>
+      </button>
     </div>
   </section>
+
+  <div id="build" hidden>
+    <section class="step">
+      <h2>1. Categories</h2>
+      <p class="lead">Their full arXiv names, separated by spaces or commas,
+        such as <code>math.AG hep-th cs.LG</code>
+        (<a href="https://arxiv.org/category_taxonomy" target="_blank"
+        rel="noopener">the list</a>). A paper is included if any of its
+        categories is one of these. More categories take longer to embed.</p>
+      <input type="text" id="cats" spellcheck="false" autocomplete="off"
+             aria-label="Categories">
+      <div class="err" id="cats-err"></div>
+    </section>
+
+    <section class="step">
+      <h2>2. Embedding model</h2>
+      <p class="lead">The model that turns abstracts and searches into vectors,
+        from the ones installed in Ollama. The default,
+        <code>qwen3-embedding:4b</code>, is the one this was tuned with. To use
+        another, <code>ollama pull</code> it and reload this page. An index keeps
+        its model for good.</p>
+      <select id="model" aria-label="Embedding model"></select>
+      <div class="err" id="model-err"></div>
+    </section>
+
+    <section class="step form">
+      <h2>3. The snapshot</h2>
+      <ol>
+        <li>Download the <a href="https://www.kaggle.com/datasets/Cornell-University/arxiv"
+          target="_blank" rel="noopener">arXiv dataset</a> from Kaggle
+          (a free account is needed).</li>
+        <li>Unzip it, and choose
+          <code>arxiv-metadata-oai-snapshot.json</code> (about 5.5 GB).</li>
+      </ol>
+      <input type="file" id="snap" accept=".json,application/json"
+             aria-label="arXiv snapshot">
+      <label class="check"><input type="checkbox" id="embed" checked>
+        Embed the papers straight away</label>
+      <span class="hint">Embedding is the long part: about three hours for three
+        categories on a consumer GPU. It runs on the server, and search works as
+        it goes.</span>
+      <button type="button" id="snap-go" disabled>Build the index</button>
+    </section>
+  </div>
+
+  <div id="import" hidden>
+    <section class="step form">
+      <h2>The export</h2>
+      <ol>
+        <li>On the other instance, use <b>Export index</b> under ⚙, or run
+          <code>arxiv_index export</code>.</li>
+        <li>Choose the <code>.tar</code> file it made.</li>
+      </ol>
+      <input type="file" id="tar" accept=".tar,application/x-tar"
+             aria-label="Exported index">
+      <label class="check"><input type="checkbox" id="take" checked>
+        Use its settings too, if it has them</label>
+      <span class="hint">Its embedding model and categories come with it. Its
+        settings, if it was exported with them, bring its followed authors and
+        interests as well.</span>
+      <button type="button" id="tar-go" disabled>Import</button>
+    </section>
+  </div>
 
   <section class="step" id="s3" hidden>
     <h2 id="p-title">Importing</h2>

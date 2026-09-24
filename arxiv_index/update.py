@@ -316,9 +316,14 @@ def update(db, max_pages: int = MAX_PAGES, log=print, progress=None) -> int:
     rather than costing a separate walk, three seconds a page, on every run.
     """
     store.check_model(db)
-    for cat in missing(db):
-        log(f"{cat} is in your settings but not in this index yet; run "
-            f"`build` to backfill it from the snapshot.")
+    skipped = missing(db)
+    if skipped:
+        # Not fetched from today either: that would mark it complete, and its
+        # history before today would never be filled in.
+        them = "it" if len(skipped) == 1 else "them"
+        log(f"{', '.join(skipped)} not in this index yet, so not fetched: "
+            f"import {them} from the arXiv snapshot, under ⚙ in the web UI or "
+            f"with `arxiv_index build <snapshot>`.")
     held = cursors(db)
     if not held:
         log("This index holds no categories yet; run `build` first.")

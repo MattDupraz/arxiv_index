@@ -6,24 +6,38 @@ const $ = s => document.querySelector(s);
 const bytes = n => n >= 1e9 ? (n / 1e9).toFixed(2) + " GB"
                             : Math.round(n / 1e6).toLocaleString() + " MB";
 const count = n => n.toLocaleString();
+// `busy` locks the forms from the moment an import is launched until it has
+// failed; one that succeeded leaves them locked, since the index is set up.
 let busy = false, uploading = false, timer = null;
 let current = null;     // the model chosen so far, if any
 
 function refresh() {
-  const noModel = !$("#model").value;
-  for (const el of ["#cats", "#model", "#snap", "#tar", "#embed", "#take"])
+  for (const el of ["#cats", "#model", "#snap", "#tar", "#embed", "#take",
+                    ".path[data-path=build]", ".path[data-path=import]"])
     $(el).disabled = busy;
-  $("#snap-go").disabled = busy || noModel || !$("#snap").files.length;
-  $("#tar-go").disabled = busy || noModel || !$("#tar").files.length;
+  // Only building needs a model chosen here; an export brings its own.
+  $("#snap-go").disabled = busy || !$("#model").value || !$("#snap").files.length;
+  $("#tar-go").disabled = busy || !$("#tar").files.length;
 }
 $("#snap").onchange = $("#tar").onchange = refresh;
+
+/* The two ways to fill the index. Choosing one opens its form and closes the
+   other's, whose choices are then not used. */
+function choose(path) {
+  for (const b of document.querySelectorAll(".path"))
+    b.setAttribute("aria-pressed", String(b.dataset.path === path));
+  $("#build").hidden = path !== "build";
+  $("#import").hidden = path !== "import";
+}
+for (const b of document.querySelectorAll(".path"))
+  b.onclick = () => choose(b.dataset.path);
 
 async function init() {
   const s = await (await fetch("/api/setup")).json();
   $("#cats").value = s.categories.join(" ");
   if (!s.local) {
     $("#remote").hidden = false;
-    $("#s1").hidden = $("#s-model").hidden = $("#s2").hidden = true;
+    $("#choose").hidden = true;
     return;
   }
   current = s.model;
@@ -42,13 +56,15 @@ async function init() {
   refresh();
   // A reload in the middle of an import picks the run up, not a second one.
   const u = await (await fetch("/api/update")).json();
-  if (u.state === "running" && (u.kind === "snapshot" || u.kind === "index"))
+  if (u.state === "running" && (u.kind === "snapshot" || u.kind === "index")) {
+    choose(u.kind === "snapshot" ? "build" : "import");
     watch(u.kind);
+  }
 }
 
 async function saveCategories() {
   $("#cats-err").textContent = "";
-  const r = await fetch("/api/setup/categories", {
+  const r = await fetch("/api/categories", {
     method: "POST", headers: {"Content-Type": "application/json"},
     body: JSON.stringify({categories: $("#cats").value})});
   const s = await r.json();
@@ -79,6 +95,10 @@ function watch(kind) {
 function stop() {
   clearInterval(timer);
   timer = null;
+}
+
+/* Unlock the forms after a failure, so it can be put right and tried again. */
+function unlock() {
   busy = false;
   refresh();
 }
@@ -116,6 +136,7 @@ function render(s) {
   if (s.state === "failed") {
     $("#p-title").textContent = "Import failed";
     $("#p-err").textContent = s.error || "unknown error";
+    unlock();
     return;
   }
   if (s.state !== "done") return;
@@ -124,6 +145,7 @@ function render(s) {
     $("#p-title").textContent = "Nothing imported";
     $("#p-err").textContent = "No papers in your categories were found in "
       + "that file. Check that it is the arXiv snapshot, and the category names.";
+    unlock();
     return;
   }
   $("#p-title").textContent = "Done";
@@ -161,10 +183,16 @@ async function ensureModel() {
 }
 
 async function upload(kind, file, params) {
-  // An export brings its own model and categories; only the snapshot needs
-  // the choices above.
+  // Locked at once, before the categories and model are saved, so a second
+  // click cannot start a second import.
+  busy = true;
+  refresh();
+  // An export brings its own model and categories; only building needs them.
   if (kind === "snapshot"
-      && (!(await saveCategories()) || !(await ensureModel()))) return;
+      && (!(await saveCategories()) || !(await ensureModel()))) {
+    unlock();
+    return;
+  }
   uploading = true;
   watch(kind);
   setBar(0);
@@ -188,6 +216,7 @@ async function upload(kind, file, params) {
   stop();
   $("#p-title").textContent = "Import not started";
   $("#p-err").textContent = answer.error;
+  unlock();
 }
 
 $("#snap-go").onclick = () => upload("snapshot", $("#snap").files[0],

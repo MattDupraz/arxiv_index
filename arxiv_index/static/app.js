@@ -115,6 +115,7 @@ function refreshStats() {
     stats = s;
     $("#scope").textContent = "· " + s.categories.join(" · ");
     categoryBoxes(s.categories);
+    fillCategories();
     note();
   });
 }
@@ -122,6 +123,41 @@ refreshStats();
 
 /* One checkbox per category, built from the server's list. Rebuilt only if
    that list changes, so a refresh of the counts keeps what is ticked. */
+/* The Categories field in the settings panel. Saving applies at once: the
+   checkboxes, the header and what the snapshot import offers all follow. */
+function fillCategories() {
+  if (stats && document.activeElement !== $("#c-list"))
+    $("#c-list").value = stats.categories.join(" ");
+}
+
+$("#c-save").onclick = async () => {
+  const note = $("#c-note");
+  note.classList.remove("bad");
+  note.textContent = "Saving…";
+  $("#c-save").disabled = true;
+  try {
+    const r = await fetch("/api/categories", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({categories: $("#c-list").value})});
+    const s = await r.json();
+    if (!r.ok) throw new Error(s.error || r.statusText);
+    $("#c-list").value = s.categories.join(" ");
+    await refreshStats();
+    note.textContent = s.missing.length
+      ? `Saved. ${s.missing.join(", ")} not in the index yet: import the `
+        + "arXiv snapshot below to add it."
+      : "Saved.";
+  } catch (e) {
+    note.classList.add("bad");
+    note.textContent = e.message;
+  } finally {
+    $("#c-save").disabled = false;
+  }
+};
+$("#c-list").addEventListener("keydown", e => {
+  if (e.key === "Enter") { e.preventDefault(); $("#c-save").click(); }
+});
+
 function categoryBoxes(categories) {
   const box = $("#catboxes"), key = categories.join(" ");
   if (box.dataset.for === key) return;
@@ -420,11 +456,11 @@ loadProfile();
 
 /* --- Automatic updates -----------------------------------------------------
 
-   Three controls for one setting, so they are saved on change rather than
-   behind the profile's Save button: a switch that needs a separate confirming
-   click is a switch people believe they have already set. The server is the
-   one that decides what a setting means, so every save re-renders from the
-   response rather than from what was typed. */
+   Three controls for one setting, saved together by their own Save button,
+   which is live only while they differ from what is saved -- and until then
+   the row says so, so an edit is not mistaken for a setting in force. The
+   server is the one that decides what a setting means, so a save re-renders
+   from the response rather than from what was typed. */
 
 let schedule = {mode: "off", hours: 6, at: "07:00", next_run: null};
 
@@ -441,14 +477,57 @@ function whenText(t) {
     : d.toLocaleDateString([], {month: "short", day: "numeric"}) + " " + hhmm);
 }
 
-function fillSchedule() {
-  $("#s-mode").value = schedule.mode;
-  $("#s-hours").value = schedule.hours;
-  $("#s-at").value = schedule.at;
-  $("#s-every").hidden = schedule.mode !== "interval";
-  $("#s-at").hidden = schedule.mode !== "daily";
-  $("#s-next").textContent =
-    schedule.mode === "off" ? "" : whenText(schedule.next_run);
+// The daily time as two lists rather than a time field, whose hour and minute
+// are small separate targets: an hour, and the quarter hour past it.
+const pad = n => String(n).padStart(2, "0");
+for (let h = 0; h < 24; h++) $("#s-hour").append(new Option(pad(h), pad(h)));
+for (const m of [0, 15, 30, 45]) $("#s-minute").append(new Option(pad(m), pad(m)));
+
+const atValue = () => `${$("#s-hour").value}:${$("#s-minute").value}`;
+
+function setAt(at) {
+  const [h, m] = at.split(":");
+  $("#s-hour").value = h;
+  // A minute off the quarter hours, from a hand edit or an older setting, is
+  // shown as it is rather than rounded behind the reader's back.
+  if (![...$("#s-minute").options].some(o => o.value === m))
+    $("#s-minute").append(new Option(m, m));
+  $("#s-minute").value = m;
+}
+
+// The saved setting the controls were last filled from; they are edited if
+// they now say something else.
+let shown = null;
+
+function scheduleEdited() {
+  if (!shown) return false;
+  const mode = $("#s-mode").value;
+  return mode !== shown.mode
+    || (mode === "interval" && Number($("#s-hours").value) !== Number(shown.hours))
+    || (mode === "daily" && atValue() !== shown.at);
+}
+
+/* Show the controls for the chosen mode, and whether they are saved. */
+function showSchedule() {
+  const mode = $("#s-mode").value, edited = scheduleEdited();
+  $("#s-every").hidden = mode !== "interval";
+  $("#s-at").hidden = mode !== "daily";
+  $("#s-save").disabled = !edited;
+  $("#s-next").textContent = edited ? "· not saved yet"
+    : schedule.mode === "off" ? "" : whenText(schedule.next_run);
+}
+
+/* Put the saved setting in the controls -- unless they hold an edit not yet
+   saved, which a re-read (on opening the panel, or after a run) must not
+   throw away. */
+function fillSchedule(force) {
+  if (force || !scheduleEdited()) {
+    $("#s-mode").value = schedule.mode;
+    $("#s-hours").value = schedule.hours;
+    setAt(schedule.at);
+    shown = schedule;
+  }
+  showSchedule();
 }
 
 async function loadSchedule() {
@@ -458,30 +537,27 @@ async function loadSchedule() {
   fillSchedule();
 }
 
-async function saveSchedule() {
-  // Render the new mode at once, so the hours/time control appears under the
-  // pointer rather than after a round trip.
-  schedule = {mode: $("#s-mode").value, hours: $("#s-hours").value,
-              at: $("#s-at").value, next_run: schedule.next_run};
-  fillSchedule();
+$("#s-save").onclick = async () => {
+  $("#s-save").disabled = true;
   try {
     const r = await fetch("/api/schedule", {
       method: "POST",
       headers: {"Content-Type": "application/json"},
       body: JSON.stringify({mode: $("#s-mode").value,
                             hours: $("#s-hours").value,
-                            at: $("#s-at").value}),
+                            at: atValue()}),
     });
+    if (!r.ok) throw new Error((await r.json()).error || r.statusText);
     schedule = await r.json();
-    fillSchedule();
+    fillSchedule(true);
   } catch (e) {
+    $("#s-save").disabled = false;
     $("#s-next").textContent = "· could not save: " + e.message;
   }
-}
+};
 
-$("#s-mode").onchange = saveSchedule;
-$("#s-hours").onchange = saveSchedule;
-$("#s-at").onchange = saveSchedule;
+for (const el of ["#s-mode", "#s-hours", "#s-hour", "#s-minute"])
+  $(el).addEventListener("input", showSchedule);
 
 loadSchedule();
 
@@ -629,12 +705,19 @@ function updateState(s) {
         ? `, embedded ${s.embedded.toLocaleString()}` : ", not embedded yet")
       : s.kind === "index"
       ? [s.lines.find(l => /^(Merged|Imported)/.test(l)) || "Index imported",
-         s.lines.find(l => /settings/.test(l))].filter(Boolean).join(" ")
+         s.lines.find(l => /settings/.test(l) && !l.endsWith("...")),
+         s.lines.find(l => l.startsWith("Now covering"))]
+        .filter(Boolean).join(" ")
       : s.kind === "embed"
       ? `Embedded ${s.embedded.toLocaleString()} paper(s)`
       : s.embedded
       ? `Fetched and embedded ${s.embedded.toLocaleString()} paper(s)`
-      : "Already up to date") + ` · ${s.elapsed}s`);
+      : "Already up to date") + ` · ${s.elapsed}s`
+      // Categories the update could not fetch, not being in the index yet.
+      + (s.kind === "update" && s.skipped && s.skipped.length
+         ? ` · ${s.skipped.join(", ")} not fetched: import `
+           + (s.skipped.length > 1 ? "them" : "it")
+           + " from the snapshot under ⚙" : ""));
   } else {
     updBox.hidden = true;
   }
@@ -709,13 +792,17 @@ function renderData() {
   const busy = running || uploading, held = !stats.missing.length;
   snapIn.disabled = $("#d-embed").disabled = held || busy;
   snapGo.disabled = held || busy || !snapIn.files.length;
+  // Its one use is the history of a newly added category, which Fetch new
+  // papers cannot reach, so it is only on while one is waiting for it.
+  const snapshot = '<a href="https://www.kaggle.com/datasets/Cornell-University/arxiv" '
+    + 'target="_blank" rel="noopener">arXiv snapshot</a>';
   $("#d-snap-note").innerHTML = held
-    ? "The index holds all your categories. To add one, list it in your "
-      + "settings file and restart the server."
-    : `Imports ${esc(stats.missing.join(", "))} from Kaggle's `
-      + '<a href="https://www.kaggle.com/datasets/Cornell-University/arxiv" '
-      + 'target="_blank" rel="noopener">arXiv snapshot</a>, unzipped: '
-      + "arxiv-metadata-oai-snapshot.json.";
+    ? `Only for filling in the history of a category just added, which Fetch `
+      + `new papers cannot reach. Every category is in the index, so there is `
+      + `nothing to fill in: add one under Categories first.`
+    : `Fills in the history of ${esc(stats.missing.join(", "))}, which Fetch `
+      + `new papers cannot reach, from Kaggle's ${snapshot}: choose `
+      + `arxiv-metadata-oai-snapshot.json, unzipped.`;
   idxIn.disabled = $("#d-mode").disabled = $("#d-take").disabled = busy;
   idxGo.disabled = busy || !idxIn.files.length;
   expGo.disabled = busy || !stats.papers;

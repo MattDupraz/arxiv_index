@@ -85,27 +85,46 @@ counts in full, which favours papers near the middle of all of them.">
         <span id="s-every" hidden>
           <input type="number" id="s-hours" min="1" max="168" step="1"> hours
         </span>
-        <input type="time" id="s-at" hidden>
+        <span id="s-at" hidden>
+          <select id="s-hour" aria-label="Hour"></select> :
+          <select id="s-minute" aria-label="Minute"></select>
+        </span>
+        <button type="button" id="s-save" class="ghost" disabled>Save</button>
         <span id="s-next"></span>
         <span class="grow"></span>
         <button type="button" id="fetch" class="ghost"
                 title="Walk the arXiv API back to where the last run stopped, then embed whatever is new">Fetch new papers</button>
       </div>
     </div>
+    <div class="sfield">
+      <b>Categories</b>
+      <span>the arXiv categories this index covers, by their full names, such
+        as <code>math.AG hep-th cs.LG</code>
+        (<a href="https://arxiv.org/category_taxonomy" target="_blank"
+        rel="noopener">the list</a>). A category added is filled in from the
+        arXiv snapshot, under Import and export below; one dropped is only
+        hidden from searches, and its papers stay in the index.</span>
+      <div class="urow">
+        <input type="text" id="c-list" spellcheck="false" autocomplete="off"
+               aria-label="Categories">
+        <button type="button" id="c-save" class="ghost">Save</button>
+        <span id="c-note"></span>
+      </div>
+    </div>
     <div class="sfield" id="data" hidden>
       <b>Import and export</b>
-      <span>Files go straight between this browser and the index, so this is
-        only offered on the machine running the server.</span>
       <div class="drow">
-        <span class="dlabel">arXiv snapshot</span>
+        <span class="dlabel">Import from the arXiv snapshot</span>
         <input type="file" id="d-snap" accept=".json,application/json">
+        <a class="dlink" href="https://www.kaggle.com/datasets/Cornell-University/arxiv"
+           target="_blank" rel="noopener">download from Kaggle ↗</a>
         <label><input type="checkbox" id="d-embed" checked> embed afterwards</label>
         <span class="grow"></span>
-        <button type="button" id="d-snap-go" class="ghost" disabled>Import papers</button>
+        <button type="button" id="d-snap-go" class="ghost" disabled>Import</button>
       </div>
       <span class="dnote" id="d-snap-note"></span>
       <div class="drow">
-        <span class="dlabel">Exported index</span>
+        <span class="dlabel">Import an exported index</span>
         <input type="file" id="d-index" accept=".tar,application/x-tar">
         <select id="d-mode">
           <option value="merge">merge into this index</option>
@@ -113,14 +132,13 @@ counts in full, which favours papers near the middle of all of them.">
         </select>
         <label title="Its categories, followed authors, interests and schedule, in place of yours, which are kept as config.json.bak"><input type="checkbox" id="d-take"> and its settings</label>
         <span class="grow"></span>
-        <button type="button" id="d-index-go" class="ghost" disabled>Import index</button>
+        <button type="button" id="d-index-go" class="ghost" disabled>Import</button>
       </div>
       <div class="drow">
-        <span class="dlabel">This index</span>
-        <span class="dnote">its papers and embeddings</span>
+        <span class="dlabel">Export this index</span>
         <label title="Your categories, followed authors, interests and schedule"><input type="checkbox" id="d-with"> with your settings</label>
         <span class="grow"></span>
-        <button type="button" id="d-export" class="ghost">Export index</button>
+        <button type="button" id="d-export" class="ghost">Export</button>
       </div>
     </div>
   </div>

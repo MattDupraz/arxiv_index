@@ -166,16 +166,25 @@ button.cog[aria-expanded="true"] {
 .sfield b { font-weight: 600; color: var(--ink); font-size: 14px; }
 .urow { display: flex; gap: 9px; align-items: center; flex-wrap: wrap;
         padding-top: 3px; }
-.urow select, .urow input[type=number], .urow input[type=time] {
+.urow select, .urow input[type=number] {
   font: inherit; font-size: 14px; padding: 5px 7px; border: 1px solid var(--line);
   border-radius: 6px; background: var(--bg); color: var(--ink);
 }
 .urow input[type=number] { width: 66px; text-align: center; }
+#c-list {
+  flex: 1 1 260px; font: inherit; font-size: 14px; padding: 5px 9px;
+  border: 1px solid var(--line); border-radius: 6px; background: var(--bg);
+  color: var(--ink);
+}
+#c-note.bad { color: var(--warn); }
+.sfield code { font-size: .92em; }
+.sfield a { color: var(--accent); }
 #s-every[hidden], #s-at[hidden] { display: none; }
+#s-at { display: inline-flex; align-items: center; gap: 4px; }
 #data[hidden] { display: none; }
 .drow { display: flex; gap: 9px; align-items: center; flex-wrap: wrap;
         padding-top: 5px; }
-.dlabel { width: 110px; flex: none; color: var(--ink); }
+.dlabel { width: 210px; flex: none; color: var(--ink); }
 /* #settings label stacks a caption over its field; these are inline. */
 #settings .drow label { flex-direction: row; align-items: center; gap: 5px; }
 .drow input[type=file] { font: inherit; font-size: 13px; color: var(--muted);
@@ -186,6 +195,7 @@ button.cog[aria-expanded="true"] {
 }
 .dnote { font-size: 12px; color: var(--muted); }
 .dnote a { color: var(--accent); }
+.dlink { font-size: 13px; color: var(--accent); white-space: nowrap; }
 #s-next { color: var(--muted); }
 .opts {
   display: flex; gap: 16px; align-items: center; flex-wrap: wrap;

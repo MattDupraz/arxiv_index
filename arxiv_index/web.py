@@ -158,13 +158,15 @@ class ResidentIndex:
         self.meta_cats = cats
         self.meta_authors = authors
 
-    def set_categories(self, categories) -> None:
+    def set_categories(self, categories, reload: bool = True) -> None:
         """Switch to other categories: on setting up, or on taking up an
-        export's settings. The category masks are rebuilt with the matrix."""
+        export's settings. The category masks are rebuilt with the matrix,
+        now or, without `reload`, by the caller."""
         with self._db_lock:
             self.categories = list(categories)
             self._read_holdings()
-            self.reload()
+            if reload:
+                self.reload()
 
     def _read_holdings(self) -> None:
         """Which categories the index holds, as they bear on the reader's."""
@@ -209,8 +211,9 @@ class ResidentIndex:
             " TOTAL(julianday(update_date)) FROM papers").fetchone()
         return tuple(vectors), tuple(metadata)
 
-    def refresh_if_stale(self) -> None:
-        """Pick up whatever changed in the index since it was loaded.
+    def refresh_if_stale(self) -> bool:
+        """Pick up whatever changed in the index since it was loaded. Returns
+        whether the matrix was reloaded.
 
         Called before every search and every few seconds by the server's
         watcher, so it has to be cheap when nothing changed: one pragma. When
@@ -227,7 +230,7 @@ class ResidentIndex:
             try:
                 current = os.stat(config.DB_PATH).st_ino
             except FileNotFoundError:
-                return          # mid-replacement; the next check finds it
+                return False    # mid-replacement; the next check finds it
             if current != self._db_file:
                 fresh = store.connect(check_same_thread=False)
                 try:
@@ -237,26 +240,30 @@ class ResidentIndex:
                     self._db_file = current     # say so once, not every check
                     print(f"The index was replaced, but not reloaded: {exc}",
                           flush=True)
-                    return
+                    return False
                 self.db.close()
                 self.db, self._db_file, self._version = fresh, current, None
                 self._vec_print = self._meta_print = None
             version, vec_file = self._data_version(), self._vector_file()
             if version == self._version and vec_file == self._vec_file:
-                return
+                return False
             if vec_file != self._vec_file:
                 self._vec_print = None
             self._version, self._vec_file = version, vec_file
             vectors, metadata = self._fingerprints()
             # The lock is reentrant, so the reloads can retake it.
+            reloaded = True
             if metadata != self._meta_print:
                 # reload() carries per-paper metadata too, so both.
                 self.reload()
                 self.reload_metadata()
             elif vectors != self._vec_print:
                 self.reload()
+            else:
+                reloaded = False
             self._vec_print, self._meta_print = vectors, metadata
             self._read_holdings()
+            return reloaded
 
     def stats(self) -> dict:
         self.refresh_if_stale()
@@ -530,6 +537,7 @@ class Updater:
         self.kind = "update"        # update | embed | snapshot | index
         self.upload = None          # an import's _Upload
         self.imported = 0           # papers in scope, once a snapshot is read
+        self.skipped = []           # categories an update left out, not held
         self.matched = 0            # the same, so far, while it is read
         self.lines = collections.deque(maxlen=self.KEEP_LINES)
         self.started = None
@@ -569,6 +577,7 @@ class Updater:
             self._categories = list(categories)
             self._take_settings = take_settings
             self.imported = self.matched = 0
+            self.skipped = []
             self.lines.clear()
             self.started = time.time()
             self.finished = None
@@ -609,6 +618,8 @@ class Updater:
                     embedded = ingest.embed_pending(db, log=self._log,
                                                     progress=self._progress)
                 else:
+                    with self._lock:
+                        self.skipped = update_mod.missing(db)
                     embedded = update_mod.update(db, log=self._log,
                                                  progress=self._progress)
         except (Exception, SystemExit) as exc:  # noqa: BLE001
@@ -652,11 +663,17 @@ class Updater:
             merge=self._mode == "merge", take_settings=self._take_settings,
             log=self._log, on_read=self.upload.finished)
         if self._index is not None:
-            # A replaced index is a new file: open it before reloading.
-            self._index.refresh_if_stale()
-            # The categories are the one setting the server reads once; the
-            # rest are read afresh wherever they are used.
-            self._index.set_categories(settings.categories())
+            # Seconds for a large index, so say so. The categories are the one
+            # setting the server reads once, and it loads the index only once:
+            # with the new ones in place first, the refresh that opens the new
+            # file builds their masks too.
+            self._log("Loading the index into the server ...")
+            wanted = settings.categories()
+            changed = wanted != self._index.categories
+            self._index.set_categories(wanted, reload=False)
+            if not self._index.refresh_if_stale() and changed:
+                self._index.reload()
+            self._log("The index is loaded.")
         return 0
 
     def _matched(self, matched: int) -> None:
@@ -678,6 +695,7 @@ class Updater:
                 "lines": list(self.lines),
                 "embedded": self.embedded,
                 "imported": self.imported,
+                "skipped": self.skipped,
                 "error": self.error,
             }
             if self.started:
@@ -892,12 +910,15 @@ def make_handler(index: ResidentIndex, updater: Updater,
             except ValueError:
                 return False
 
-        def _trusted(self) -> bool:
-            """On this machine, and not a request from another site open in
-            the same browser: a cross-site request carries its Origin."""
+        def _same_origin(self) -> bool:
+            """Not a request from another site open in the same browser: a
+            cross-site request carries its Origin."""
             origin = self.headers.get("Origin")
-            return self._local() and (
-                not origin or urlparse(origin).netloc == self.headers.get("Host"))
+            return not origin or urlparse(origin).netloc == self.headers.get("Host")
+
+        def _trusted(self) -> bool:
+            """On this machine, and from this page."""
+            return self._local() and self._same_origin()
 
         def _receive(self, kind: str, query) -> None:
             """Take an uploaded import and start it, answering once the upload
@@ -1081,29 +1102,30 @@ def make_handler(index: ResidentIndex, updater: Updater,
                 if body is not None and not isinstance(body, dict):
                     body = None
                 path = urlparse(self.path).path
-                if path == "/api/setup/categories":
-                    if not self._trusted():
-                        self._json({"error": "Setting up is only offered on "
-                                             "the machine running the server."},
+                if path == "/api/categories":
+                    # From the setup page and the settings panel alike. A
+                    # category added is then offered for import from the
+                    # snapshot; one dropped is hidden from searches, not
+                    # deleted (see update.update).
+                    if not self._same_origin():
+                        self._json({"error": "Refused: not from this page."},
                                    403)
                         return
+                    text = str((body or {}).get("categories", ""))
+                    if not text.strip():
+                        self._json({"error": "List at least one category."},
+                                   400)
+                        return
                     try:
-                        chosen = settings.parse_categories(
-                            str((body or {}).get("categories", "")))
+                        chosen = settings.parse_categories(text)
                     except ValueError as exc:
                         self._json({"error": str(exc)}, 400)
                         return
-                    if index.stats()["papers"] and chosen != index.categories:
-                        # The masks the page filters with are built per
-                        # category at start; see ResidentIndex.categories. The
-                        # same list again is fine: a retry after a failed import.
-                        self._json({"error": "The index already has papers; "
-                                             "change the categories in the "
-                                             "settings file and restart."}, 409)
-                        return
-                    settings.update(categories=chosen)
-                    index.set_categories(chosen)
-                    self._json({"categories": chosen})
+                    if chosen != index.categories:
+                        settings.update(categories=chosen)
+                        index.set_categories(chosen)
+                    self._json({"categories": chosen,
+                                "missing": index.missing})
                     return
 
                 if path == "/api/setup/model":

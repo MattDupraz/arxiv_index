@@ -194,21 +194,28 @@ def import_stream(fileobj, source: str, replace: bool = False,
                              "papers.db.")
         if on_read:
             on_read()
+        log("Checking the export ...")
         meta = _check(staged, source, adopt=fresh)
         has_settings = SETTINGS in seen
         taking = take_settings and has_settings
         if taking:
             _check_settings(staged[SETTINGS], source, adopt=fresh)
+        merging = existing and merge and not fresh
+        if fresh or merging:
+            held = _held_categories(staged["papers.db"])
         if fresh:
             embedding = _index_embedding(
                 meta, staged[SETTINGS] if has_settings else None)
-            held = _held_categories(staged["papers.db"])
-        if existing and merge and not fresh:
+        if merging:
+            ours = settings.categories()
+            log("Merging it into this index ...")
             _merge(staged, log=log)
         else:
+            log("Installing the index ...")
             _install(staged)
             log(f"Imported the index from {source} into {config.INDEX_DIR}.")
         if taking:
+            log("Importing its settings ...")
             _take_settings(staged, log)
         elif take_settings:
             log(f"{source} holds no settings; yours are unchanged.")
@@ -217,6 +224,8 @@ def import_stream(fileobj, source: str, replace: bool = False,
                 "and yours are unchanged.")
         if fresh:
             _adopt(embedding, None if taking else held, log)
+        if merging:
+            _widen_categories(ours, held, log)
         return {"settings": taking, "model": config.model()}
     finally:
         for path in staged.values():
@@ -303,6 +312,22 @@ def _index_embedding(meta: dict, settings_file) -> dict:
     return out
 
 
+def _widen_categories(ours: list, held: list, log) -> None:
+    """After a merge, cover what the merged index holds: the categories named
+    before, then any the export brought -- those its index holds and, if its
+    settings were taken up, those they name. Otherwise the export's categories
+    would be in the index but hidden from every search, and taking its
+    settings would hide some of one's own."""
+    now = settings.categories()     # the export's, if its settings came in
+    wanted = list(dict.fromkeys(ours + now + held))
+    added = [c for c in wanted if c not in ours]
+    if wanted != now:
+        settings.update(categories=wanted)
+    if added:
+        log(f"Now covering {', '.join(wanted)}: {', '.join(added)} came with "
+            "the export.")
+
+
 def _held_categories(db_path) -> list:
     """The categories an export's index holds, in their usual order."""
     db = sqlite3.connect(db_path)
@@ -321,6 +346,7 @@ def _adopt(embedding: dict, categories, log) -> None:
     model = config.use(embedding)["model"]
     log(f"This index now uses the embedding model {model}"
         + (f", and covers {', '.join(categories)}." if categories else "."))
+    log(f"Checking that Ollama has {model} ...")
     try:
         installed = {m["name"] for m in embedder.embedding_models()}
     except SystemExit:

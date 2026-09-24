@@ -74,17 +74,17 @@ a GPU.
 arxiv_index serve     # opens http://127.0.0.1:8000/
 ```
 
-While the index is empty, the page that opens is a first-time setup:
+While the index is empty, the page that opens is a first-time setup, which
+asks first how to fill the index:
 
-1. **Categories:** the arXiv categories to cover, by their full names
-   (`math.AG`, `hep-th`, `cs.LG`; see the
-   [list](https://arxiv.org/category_taxonomy)). The default is math.AC,
-   math.AG and math.CO.
-2. **Embedding model:** one of the embedding models installed in Ollama.
-3. **Fill the index:** choose the snapshot, and whether to embed the papers
-   straight away; or choose an export, which brings its own model and
-   categories in place of the two choices above, and its followed authors and
-   interests too if it was exported with its settings.
+- **Build it from arXiv's snapshot.** Choose the categories to cover, by their
+  full names (`math.AG`, `hep-th`, `cs.LG`; see the
+  [list](https://arxiv.org/category_taxonomy); the default is math.AC, math.AG
+  and math.CO), the embedding model, from those installed in Ollama, and the
+  snapshot file, and whether to embed the papers straight away.
+- **Import an exported index.** Choose the export, and nothing else: its
+  embedding model and categories come with it, and so do its followed authors
+  and interests if it was exported with its settings.
 
 The page shows the progress. Keep the tab open until the file has been read, a
 minute or two for the snapshot. The embedding that follows runs on the server,
@@ -160,7 +160,8 @@ handing someone `papers.db` and `vectors.f16` does not hand them your profile.
 
 The profile and the automatic-update setting are stored here too, written by
 the web UI. Hand edits are picked up without a restart, except the two keys
-above, which `serve` reads once.
+above, which `serve` reads once; categories changed in the web UI, under the
+cog, apply at once.
 
 ### Another embedding model
 
@@ -188,16 +189,22 @@ time.
 
 ### Adding a category
 
-Add it to `categories` and run `build` with the snapshot's path. That scans the
-snapshot **for the new categories only**, leaving papers already held alone,
-and the next `update` fills in everything since the snapshot was taken. Until
-then, `status` and the web UI list it as not yet in the index. A name that
-matches no papers in the snapshot is reported, since it is most likely a typo.
+In the web UI, add it under **Categories** in the settings (the cog) and save;
+it applies at once. **Import from the arXiv snapshot** below it then offers the new
+category: choose the snapshot there to fill it in. In a terminal, add it to
+`categories` in the settings file and run `build` with the snapshot's path.
+
+Either way the snapshot is scanned **for the new categories only**, leaving
+papers already held alone, and the next update fills in everything since the
+snapshot was taken. Until then, `status` and the web UI list it as not yet in
+the index. A name that matches no papers in the snapshot is reported, since it
+is most likely a typo.
 
 ### Removing a category
 
-Removing a category from your settings hides it rather than deleting it. With
-no category ticked, searches cover **your** categories only. The index still
+Removing a category, under **Categories** in the web UI or from the settings
+file, hides it rather than deleting it. With no category ticked, searches cover
+**your** categories only. The index still
 holds the dropped one (as it does the categories of an index someone copied to
 you), and `update` keeps every category it holds current.
 
@@ -216,7 +223,8 @@ also holds your settings file (categories, followed authors, interests, the
 update schedule) and the cached embeddings of your interests, so another
 machine can be set up as a copy of this one. `import --settings` takes them up
 in place of the settings there, which are kept as `config.json.bak`; without
-it they are left out. Settings naming a different embedding model from the
+it they are left out. Merging with `--settings` keeps your categories as well
+as the export's. Settings naming a different embedding model from the
 index's are refused.
 
 Into an empty index, a fresh install, the export brings its embedding model
@@ -227,7 +235,7 @@ your settings name is refused, and it needs one of:
 
 | | |
 |---|---|
-| `--merge` | add the export's papers to this index. A paper in both keeps the more recent copy (the later arXiv version, then the later date), with its embedding. A category in both is complete up to the later of the two dates. Nothing needs embedding again |
+| `--merge` | add the export's papers to this index. A paper in both keeps the more recent copy (the later arXiv version, then the later date), with its embedding. A category in both is complete up to the later of the two dates, and the export's categories are added to yours, so none is hidden. Nothing needs embedding again |
 | `--replace` | discard this index and install the export in its place |
 
 A running `serve` picks up the result within a few seconds, as it does any
@@ -241,9 +249,9 @@ Under the cog, **Import and export** does the same without a terminal:
 
 | | |
 |---|---|
-| **arXiv snapshot** | pick `arxiv-metadata-oai-snapshot.json` to import the papers of your categories the index does not hold yet, like `build`, and optionally embed them |
-| **Exported index** | pick an export to merge into this index or replace it, like `import`; tick **and its settings** to take those up too |
-| **Export index** | downloads an export, like `export`; tick **with your settings** to include them |
+| **Import from the arXiv snapshot** | only for a category just added under **Categories**: pick `arxiv-metadata-oai-snapshot.json` to fill in its history, which **Fetch new papers** cannot reach, like `build`, and optionally embed it. Off while every category is in the index |
+| **Import an exported index** | pick an export to merge into this index or replace it, like `import`; tick **and its settings** to take those up too |
+| **Export this index** | downloads an export, like `export`; tick **with your settings** to include them |
 
 The file is streamed between the browser and the server, never held whole, and
 progress shows under the settings. An import's upload needs the tab open until
@@ -378,7 +386,7 @@ as `serve` is up, so an index does not go stale behind a server left running:
 |---|---|
 | **Off** | the default |
 | **Every N hours** | measured from when the last run started, 1 to 168 |
-| **Daily at HH:MM** | a wall-clock time, in the server machine's **local** time |
+| **Daily at HH:MM** | a wall-clock time to the quarter hour, in the server machine's **local** time |
 
 Local rather than UTC on purpose: 07:00 means 07:00 where you are, and arXiv's
 announcements go out at a fixed New York time.
@@ -388,9 +396,9 @@ asleep until 09:00 fires at 09:00. Switching the setting on works the same way:
 if a slot has passed and nothing has run since, the first run happens within the
 minute. Manual runs count, so **Fetch new papers** resets the clock.
 
-Changes take effect within 30 seconds, no restart needed. For updates without a
-server running, use cron, giving the command's full path (`which
-arxiv_index`) if cron's `PATH` does not reach it:
+Set it and press its **Save**; it takes effect within 30 seconds, no restart
+needed. For updates without a server running, use cron, giving the command's
+full path (`which arxiv_index`) if cron's `PATH` does not reach it:
 
 ```cron
 0 7 * * 1  arxiv_index update >> ~/.arxiv_index/update.log 2>&1
