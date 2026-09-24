@@ -3,9 +3,10 @@
 Why the index is built the way it is: the measurements behind each choice, and
 the things that were tried and did not work. None of this is needed to use it —
 the [README](README.md) covers that. Much of it also appears as comments at the
-point of use, where it is harder to miss: the reranker comparison in
-`config.py`, the arXiv API traps in `update.py`, the storage invariants in
-`store.py`.
+point of use, where it is harder to miss: the query-embedding measurements
+in `config.py`, the arXiv API traps in `update.py`, the storage invariants in
+`store.py`. Reranking, and how its model was chosen, is on the `reranking`
+branch.
 
 ## Search is exact, with no ANN index
 
@@ -34,7 +35,6 @@ Resident set of the `serve` process, measured on the 145k-paper index:
 |---|---|---|
 | CPU search (`GPU_SEARCH = False`) | 840 MB | **98 MB** |
 | GPU search | 1.0 GB | 566 MB |
-| after one reranked search | 2.1 GB | 1.5 GB |
 
 Only the anonymous column is memory the kernel cannot take back. On the CPU path
 the other 742 MB is the vector file mapped in: clean page-cache, evicted under
@@ -44,9 +44,8 @@ mean 840 MB is unavailable to anything else.
 Almost everything above 100 MB is torch: ~480 MB to import it and open a HIP
 context, and another ~700 MB the first time a kernel runs, which is ROCm loading
 its kernel libraries and is not returned afterwards. That cost is per-process and
-independent of corpus size. It buys the 149× search speed-up and the reranker; if
-neither is wanted, `GPU_SEARCH = False` and leaving **Rerank** unticked keeps the
-process under 100 MB of real memory.
+independent of corpus size. It buys the 149× search speed-up; if that is not
+wanted, `GPU_SEARCH = False` keeps the process under 100 MB of real memory.
 
 Two things keep the rest small, both of which had to be built rather than freed —
 CPython returns very little to the OS once it has grown:
@@ -59,79 +58,6 @@ CPython returns very little to the OS once it has grown:
   across 145k papers, plus every folded author string built twice. Holding one
   instance of each turns 47 MB of category sets into under one.
 
-## Reranking
-
-The index is a *bi-encoder*: query and document are embedded separately, so their
-vectors never interact and the ranking is only as good as one dot product can
-express. A cross-encoder reads the pair *together* — much better, and far too
-slow for 145k papers. So the index proposes 50 candidates and
-`Alibaba-NLP/gte-reranker-modernbert-base` reorders them.
-
-Measured on 50 known-item queries against identical shortlists:
-
-| | recall@1 | recall@5 | MRR | 50 docs | VRAM |
-|---|---|---|---|---|---|
-| vector only | 0.500 | 0.760 | 0.622 | — | — |
-| Qwen3-Reranker-0.6B | 0.760 | 0.820 | 0.781 | 1.66 s | 1.11 G |
-| Qwen3-Reranker-4B | 0.800 | 0.860 | 0.827 | 4.09 s | 7.54 G |
-| bge-reranker-v2-m3 | 0.820 | 0.860 | 0.835 | 0.65 s | 1.13 G |
-| **gte-reranker-modernbert-base** | **0.860** | **0.860** | **0.860** | **0.38 s** | **0.36 G** |
-
-modernbert beat bge on 2 cases, lost 0, tied 41. Two discordant pairs is not
-significance — but every earlier comparison traded wins for losses, and this one
-is strictly non-worse at 1.7× the speed in a third of the VRAM.
-
-### A failure the harness could not see
-
-Asked for *"K-rings of matroids"*, bge put a paper on **g-elements** above the
-actual **K-rings** paper — 2.35 against 2.26, i.e. the wrong order and only 0.09
-apart in a 2.9 range. It recognised "matroid", which all 50 candidates share so
-the signal is useless, and knew nothing about K-theory. The embedding meanwhile
-had the right paper at cosine rank 2: confident and correct. modernbert scores
-the same pair 3.79 and 1.74.
-
-Known-item retrieval measures finding *one specific paper*. It cannot detect bad
-ordering among near-neighbours in a jargon-dense field, which is what browsing
-actually surfaces. One real query was worth more than fifty synthetic ones.
-
-Reciprocal rank fusion was tried as a fix — blending the reranker's order with
-the index's so an indifferent reranker cannot overrule a confident index. It
-repaired that query but cost 10 points of recall@1 (0.820 → 0.720), because it
-damps the reranker uniformly: of four cases where it pulled a target from rank
-≥10 into the top 3, fusion pushed three back out. Removed. A better model turned
-out to be the right answer. If the problem recurs, the principled version is to
-gate fusion on the reranker's confidence — fuse only when its top margins are
-bunched — which would keep the rescues.
-
-### Models that did not work here
-
-| | |
-|---|---|
-| zerank-2 (4 B), zerank-1-small (1.7 B) | never finished loading — CPU-bound at ~0.25 GiB/min, >5 min even on an idle GPU |
-| gte-multilingual-reranker-base | crashed the GPU (`HSA_STATUS_ERROR_EXCEPTION`) on its custom kernels |
-| jina-reranker-v2 | custom code imports symbols removed in transformers 5.x |
-| jina-reranker-v3 | `score.weight` absent from the checkpoint — the head loads randomly initialised |
-
-The pattern: **anything relying on custom remote code is a lottery** on RDNA4
-with transformers 5.x. Plain `ForSequenceClassification` on stock transformers
-works. The backend refuses other architectures rather than guessing, because
-loading a causal model through `AutoModelForSequenceClassification` *succeeds*
-and silently invents a classification head — worse than an error.
-
-### Details that carry the performance
-
-`RERANK_CANDIDATES` is 50 rather than 100 on measurement: doubling the shortlist
-moved the known-item ceiling only from 86% to 88%, because six of the seven
-misses are not in the top 100 either. Those are failures of the embedding, not
-of the cutoff.
-
-- **Sort by length before batching.** Every sequence is padded to the longest in
-  its batch, and on a real shortlist that padding was 40% of the compute.
-- **Small batches beat large**, for the same reason.
-- **Right padding is a correctness requirement**, not a preference. The model
-  reads CLS at position 0; pad on the left and it still returns plausible numbers
-  while scoring the wrong position.
-
 ## Embedding
 
 - Documents are embedded as `"{title}\n\n{abstract}"` with whitespace collapsed
@@ -143,9 +69,8 @@ of the cutoff.
 Change `MODEL` in `config.py` and the index refuses to load rather than silently
 mixing incomparable vectors.
 
-**The query embedding runs on the CPU.** A search embeds one short query while
-the reranker scores fifty documents, so the GPU is better spent on the latter:
-175 ms against 89 ms, in exchange for 4.1 GB of VRAM. Indexing keeps the GPU at
+**The query embedding runs on the CPU**: 175 ms against 89 ms on the GPU, in
+exchange for 4.1 GB of VRAM left to the vector matrix and to builds. Indexing keeps the GPU at
 14.1 docs/s.
 
 `num_gpu` must be stated explicitly on **both** paths. Ollama does not move a

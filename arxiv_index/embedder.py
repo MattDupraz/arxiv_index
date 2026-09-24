@@ -58,7 +58,7 @@ def embed_documents(titles_and_abstracts) -> np.ndarray:
 
 
 def embed_query(query: str) -> np.ndarray:
-    """Embed a search query on the CPU, keeping the GPU free for reranking."""
+    """Embed a search query on the CPU; see OLLAMA_QUERY_OPTIONS for why."""
     return embed([config.query_text(query)],
                  options=config.OLLAMA_QUERY_OPTIONS)[0]
 

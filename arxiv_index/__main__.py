@@ -20,12 +20,7 @@ def _abs_url(paper_id: str) -> str:
 
 
 def print_results(results, full: bool = False, scores: bool = False) -> None:
-    """Print ranked results. Scores are diagnostics, so they are off by default.
-
-    With `scores`, a reranked hit shows both numbers -- the relevance logit the
-    order is based on, and the cosine it started from -- since they are on
-    unrelated scales and one without the other is misleading.
-    """
+    """Print ranked results. Scores are diagnostics, so they are off by default."""
     if not results:
         print("No matches.")
         return
@@ -33,11 +28,7 @@ def print_results(results, full: bool = False, scores: bool = False) -> None:
         title = " ".join(paper["title"].split())
         score = ""
         if scores and paper.get("score") is not None:
-            if paper.get("rerank_margin") is not None:
-                score = (f"[rr {paper['rerank_margin']:5.2f} · "
-                         f"cos {paper['vector_score']:.3f}] ")
-            else:
-                score = f"[cos {paper['score']:.3f}] "
+            score = f"[cos {paper['score']:.3f}] "
         print(f"\n{rank:2d}. {score}{title}")
         print(f"    {paper['categories']}  ·  {paper['update_date']}  ·  "
               f"{_abs_url(paper['id'])}")
@@ -139,7 +130,7 @@ def cmd_search(args) -> None:
         categories = settings.categories()
     results = search_mod.search(
         db, args.query, k=args.k, categories=categories, since=args.since,
-        author=args.author, rerank=args.rerank,
+        author=args.author,
     )
     if args.json:
         json.dump(results, sys.stdout, indent=2)
@@ -167,14 +158,12 @@ def cmd_similar(args) -> None:
     matrix, ids = store.load_matrix(db)
     scores = search_mod.score_all(matrix, vector)
 
-    # A wider net when reranking; the cross-encoder can only reorder what it is
-    # given. +1 throughout because the paper matches itself.
-    shortlist = max(args.k, config.RERANK_CANDIDATES) if args.rerank else args.k
-    n = min(shortlist + 1, len(ids))
+    # +1 because the paper matches itself.
+    n = min(args.k + 1, len(ids))
     top = np.argpartition(-scores, n - 1)[:n]
     top = top[np.argsort(-scores[top])]
 
-    chosen = [ids[i] for i in top if ids[i] != args.id][:shortlist]
+    chosen = [ids[i] for i in top if ids[i] != args.id][:args.k]
     meta = {
         r["id"]: dict(r)
         for r in db.execute(
@@ -185,22 +174,8 @@ def cmd_similar(args) -> None:
     by_id = {ids[i]: float(scores[i]) for i in top}
     results = [meta[i] | {"score": by_id[i]} for i in chosen]
 
-    if args.rerank:
-        from . import rerank as rerank_mod
-
-        source = db.execute("SELECT * FROM papers WHERE id = ?",
-                            (args.id,)).fetchone()
-        try:
-            # The source paper's own text stands in for the query: the model
-            # scores a text pair either way.
-            results = rerank_mod.rerank(
-                rerank_mod.document_text(dict(source)), results)
-        except rerank_mod.RerankUnavailable as exc:
-            print(f"warning: reranking unavailable, showing vector order "
-                  f"({exc})", file=sys.stderr)
-
     print(f"\nSimilar to: {' '.join(row['title'].split())}")
-    print_results(results[:args.k], full=args.full, scores=args.scores)
+    print_results(results, full=args.full, scores=args.scores)
 
 
 def cmd_serve(args) -> None:
@@ -330,9 +305,6 @@ def main(argv=None) -> None:
                         "'Hardy,Littlewood' finds their joint work); accents "
                         "and case are ignored")
     p.add_argument("--since", metavar="YYYY-MM-DD", help="only papers this recent")
-    p.add_argument("--rerank", action="store_true",
-                   help=f"rescore the top {config.RERANK_CANDIDATES} hits with "
-                        "a cross-encoder; better ordering, several seconds slower")
     p.add_argument("--scores", action="store_true",
                    help="show relevance scores alongside each hit")
     p.add_argument("--full", action="store_true", help="print abstracts")
@@ -342,9 +314,6 @@ def main(argv=None) -> None:
     p = sub.add_parser("similar", help="find papers like a given arXiv id")
     p.add_argument("id")
     p.add_argument("-k", type=int, default=10)
-    p.add_argument("--rerank", action="store_true",
-                   help="rescore with the cross-encoder, using this paper's "
-                        "own text in place of a query")
     p.add_argument("--scores", action="store_true",
                    help="show relevance scores alongside each hit")
     p.add_argument("--full", action="store_true")

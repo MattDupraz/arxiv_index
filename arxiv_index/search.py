@@ -87,17 +87,11 @@ def browse(db, k: int = 10, categories=None, since: str = None,
 
 
 def search(db, query: str, k: int = 10, categories=None, since: str = None,
-           author: str = None, rerank: bool = False):
-    """Return the k best matches as a list of sqlite3.Row, each with `score`.
-
-    With `rerank`, the index proposes RERANK_CANDIDATES hits and a cross-encoder
-    reorders them, which is where the quality comes from -- the index only has
-    to get the right papers into the shortlist, not order them well.
-    """
+           author: str = None):
+    """Return the k best matches as a list of sqlite3.Row, each with `score`."""
     if not query:
         return browse(db, k, categories, since, author)
     store.check_model(db)
-    want = max(k, config.RERANK_CANDIDATES) if rerank else k
 
     clauses, params = [], []
     if categories:
@@ -118,9 +112,7 @@ def search(db, query: str, k: int = 10, categories=None, since: str = None,
         return []
 
     scores = score_all(matrix, embed_query_normalised(query))
-    # Shortlist size, which is larger than k when reranking. `k` must survive
-    # unchanged: it is what the caller actually asked for.
-    shortlist = min(want, len(ids))
+    shortlist = min(k, len(ids))
     # argpartition finds the top n without sorting the whole score array.
     top = np.argpartition(-scores, shortlist - 1)[:shortlist]
     top = top[np.argsort(-scores[top])]
@@ -133,20 +125,7 @@ def search(db, query: str, k: int = 10, categories=None, since: str = None,
             f"SELECT * FROM papers WHERE id IN ({placeholders})", chosen
         )
     }
-    hits = [(dict(meta[ids[i]]) | {"score": float(scores[i])}) for i in top]
-    if rerank:
-        import sys
-
-        from . import rerank as rerank_mod
-
-        try:
-            hits = rerank_mod.rerank(query, hits)
-        except rerank_mod.RerankUnavailable as exc:
-            # Degrade to vector order rather than losing the search, and say
-            # why. Usual causes: torch not installed, or no free VRAM.
-            print(f"warning: reranking unavailable, showing vector order "
-                  f"({exc})", file=sys.stderr)
-    return hits[:k]
+    return [(dict(meta[ids[i]]) | {"score": float(scores[i])}) for i in top]
 
 
 @functools.lru_cache(maxsize=512)
@@ -166,7 +145,7 @@ def embed_query_normalised(query: str) -> np.ndarray:
 
     The cache is a latency optimisation: ~104ms per repeat, more while a build
     competes for the GPU. It earns its keep because changing any filter -- the
-    reranker toggle, the result count, a category -- resubmits the same query
+    result count, a category, the dates -- resubmits the same query
     text, and those re-searches then skip the embedding call.
 
     It also makes repeated searches return identical cosines, because Ollama's

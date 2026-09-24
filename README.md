@@ -33,14 +33,11 @@ To use a different model, see [Another embedding model](#another-embedding-model
 git clone https://github.com/MattDupraz/arxiv_index.git
 cd arxiv_index
 pip install numpy ollama
-pip install torch transformers   # optional, see below
+pip install torch   # optional, see below
 ```
 
-torch and transformers are optional and only help with a GPU. They enable
-**reranking**, which reorders the top results with a second, more accurate
-model, downloaded on first use (about 570 MB), and they let the web UI search
-on the GPU, which is faster. Without them everything works, on the CPU and
-unreranked.
+torch is optional and only helps with a GPU: it lets the web UI search on the
+GPU, which is faster. Without it everything works, on the CPU.
 
 Every command below is run from this directory.
 
@@ -216,12 +213,6 @@ python3 -m arxiv_index search --author "Hardy, Littlewood"  # no query needed
 python3 -m arxiv_index similar 0704.0002
 ```
 
-**Reranking** rescores the top 50 hits with a cross-encoder, which is markedly
-better ordering — known-item recall@1 goes from 0.50 to 0.86 — at about a second
-per search. It needs torch and a GPU; the **Rerank** checkbox appears only when
-they are installed. Author-only listings skip it, having no query to be relevant
-to.
-
 **Scores are hidden by default** in both interfaces. The **Scores** checkbox and
 `--scores` reveal them.
 
@@ -243,7 +234,7 @@ newest-first. This is a *union* — the opposite of the author box, where severa
 names mean papers written **together**.
 
 **Rank by my interests** orders the same range by closeness to what you work on.
-Embedding only, no reranking, and only embedded papers can be ranked.
+Only embedded papers can be ranked.
 
 Write one interest per project rather than one paragraph: each is embedded
 **separately**, so they stay distinct instead of averaging into a point that is
@@ -342,7 +333,7 @@ server running, use cron:
 |---|---|
 | `build [SNAPSHOT]` | backfill from the snapshot, then embed. `--scan-only` stops before embedding, `--embed-only` skips the scan |
 | `update` | fetch and embed what is new from the arXiv API |
-| `search` | semantic search; `--author`, `--category`, `--since`, `--rerank`, `--scores`, `--full`, `--json` |
+| `search` | semantic search; `--author`, `--category`, `--since`, `--scores`, `--full`, `--json` |
 | `similar` | neighbours of a given arXiv id |
 | `serve` | the web UI; `--port`, `--host`, `--no-browser` |
 | `status` | settings file, index location, model, counts, and per category how far it is complete |
@@ -358,8 +349,8 @@ indirectly, Ollama, so think before changing `--host`.
 
 How the index is built is in `config.py`, with the measurements behind each
 choice in the comments; what differs between people is in the settings file.
-Deeper background — why search is brute-force, how the reranker was chosen,
-what was tried and abandoned — is in [NOTES.md](NOTES.md).
+Deeper background — why search is brute-force, what was tried and abandoned
+— is in [NOTES.md](NOTES.md).
 
 | | |
 |---|---|
@@ -370,7 +361,6 @@ what was tried and abandoned — is in [NOTES.md](NOTES.md).
 | `ingest.py` | snapshot scan + the resumable embedding loop |
 | `update.py` | incremental fetch from the arXiv API |
 | `search.py` | exact cosine search, author filtering |
-| `rerank.py` | cross-encoder reranking of the shortlist |
 | `textnorm.py` | LaTeX author names, folded for matching |
 | `cite.py` | biblatex entries |
 | `transfer.py` | exporting and importing an index |

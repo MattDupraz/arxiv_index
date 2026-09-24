@@ -34,7 +34,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 import numpy as np
 
 from . import (cite, config, ingest, profile as profile_mod,
-               rerank as rerank_mod, schedule as schedule_mod, search as search_mod, settings,
+               schedule as schedule_mod, search as search_mod, settings,
                store, textnorm, update as update_mod)
 
 # Vendored KaTeX (js, css, woff2 subset). Kept local rather than pulled from a
@@ -336,10 +336,10 @@ class ResidentIndex:
         return keep
 
     def query(self, text, k=20, categories=None, since=None, exclude=None,
-              author=None, rerank=False, until=None):
+              author=None, until=None):
         self.refresh_if_stale()
         if not self.ids:
-            return [], 0.0, None
+            return [], 0.0
 
         started = time.monotonic()
 
@@ -347,7 +347,7 @@ class ResidentIndex:
             # No query to be similar to, so this is a metadata listing and has
             # no business consulting the vectors at all.
             return (self.browse(k, categories, since, author, until),
-                    time.monotonic() - started, None)
+                    time.monotonic() - started)
 
         keep = self._mask(categories, since, until, author)
 
@@ -356,34 +356,24 @@ class ResidentIndex:
 
         if keep is not None:
             if not keep.any():
-                return [], time.monotonic() - started, None
+                return [], time.monotonic() - started
             # Push filtered-out rows below any real cosine rather than
             # compacting the array, which would cost a copy.
             scores = np.where(keep, scores, -2.0)
 
-        # Reranking needs a shortlist bigger than the caller asked for; the
-        # cross-encoder's job is to reorder it down to k.
-        shortlist = max(k, config.RERANK_CANDIDATES) if rerank else k
-        want = min(shortlist + (1 if exclude else 0), len(self.ids))
+        want = min(k + (1 if exclude else 0), len(self.ids))
         top = np.argpartition(-scores, want - 1)[:want]
         top = top[np.argsort(-scores[top])]
 
         chosen = [self.ids[i] for i in top
-                  if scores[i] > -2.0 and self.ids[i] != exclude][:shortlist]
+                  if scores[i] > -2.0 and self.ids[i] != exclude][:k]
         if not chosen:
-            return [], time.monotonic() - started, None
+            return [], time.monotonic() - started
 
         by_id = {self.ids[i]: float(scores[i]) for i in top}
         meta = self._meta(chosen)
-        results = [meta[i] | {"score": by_id[i]} for i in chosen]
-        if rerank and results:
-            # A reranker failure must not take the search down with it: fall
-            # back to the vector order and let the caller say so.
-            try:
-                results = rerank_mod.rerank(text, results)
-            except rerank_mod.RerankUnavailable as exc:
-                return results[:k], time.monotonic() - started, str(exc)
-        return results[:k], time.monotonic() - started, None
+        return ([meta[i] | {"score": by_id[i]} for i in chosen],
+                time.monotonic() - started)
 
     def _matching_rows(self, categories=None, since=None, until=None,
                        match_author=None):
@@ -491,11 +481,6 @@ class ResidentIndex:
         and each further one counts less. `blend` picks how much less: 0 scores
         a paper by its single best interest, 1 by all of them equally.
 
-        Vectors only, deliberately. The cross-encoder scores a *query* against
-        a document, and a standing description of what someone works on is not
-        a query; it would also bound the listing at RERANK_CANDIDATES, capping
-        something whose whole job is to cover a window.
-
         Only embedded papers can appear -- ranking needs a vector -- so the
         caller is left to say how much of the window is still waiting.
         """
@@ -567,42 +552,25 @@ class ResidentIndex:
                        shape=(total, config.DIM))
         return np.asarray(mm[row["row"]], dtype=np.float32)
 
-    def similar(self, paper_id, k=20, rerank=False):
-        """Papers closest to a given one.
-
-        With `rerank`, the cross-encoder rescores the shortlist using the source
-        paper's own title and abstract in place of a query. It is a text pair
-        either way, so nothing about the model changes -- only that the left
-        side is an abstract rather than a question.
-        """
+    def similar(self, paper_id, k=20):
+        """Papers closest to a given one."""
         self.refresh_if_stale()
         vector = self.vector_for(paper_id)
         if vector is None:
-            return None, 0.0, None
+            return None, 0.0
         started = time.monotonic()
         scores = self.score(vector)
-        # A wider net when reranking, for the same reason as in search: the
-        # cross-encoder can only reorder what the index hands it.
-        shortlist = max(k, config.RERANK_CANDIDATES) if rerank else k
-        want = min(shortlist + 1, len(self.ids))
+        # +1 because the paper matches itself.
+        want = min(k + 1, len(self.ids))
         top = np.argpartition(-scores, want - 1)[:want]
         top = top[np.argsort(-scores[top])]
-        chosen = [self.ids[i] for i in top if self.ids[i] != paper_id][:shortlist]
+        chosen = [self.ids[i] for i in top if self.ids[i] != paper_id][:k]
         if not chosen:
-            return [], time.monotonic() - started, None
+            return [], time.monotonic() - started
         by_id = {self.ids[i]: float(scores[i]) for i in top}
         meta = self._meta(chosen)
-        results = [meta[i] | {"score": by_id[i]} for i in chosen]
-
-        if rerank:
-            source = self._meta([paper_id]).get(paper_id)
-            if source:
-                try:
-                    results = rerank_mod.rerank(
-                        rerank_mod.document_text(source), results)
-                except rerank_mod.RerankUnavailable as exc:
-                    return results[:k], time.monotonic() - started, str(exc)
-        return results[:k], time.monotonic() - started, None
+        return ([meta[i] | {"score": by_id[i]} for i in chosen],
+                time.monotonic() - started)
 
 
 class Updater:
@@ -1139,7 +1107,7 @@ def make_handler(index: ResidentIndex, updater: Updater,
                     queries, weights, profile["blend"], k,
                     categories=cats, since=since, until=until)
                 payload = {"results": results, "ms": round(elapsed * 1000),
-                           "ranked": "relevance", "reranked": False,
+                           "ranked": "relevance",
                            "interests": len(weights)}
                 if not results:
                     # Same trap as an empty relevance search: the window may be
@@ -1175,19 +1143,15 @@ def make_handler(index: ResidentIndex, updater: Updater,
                     self._json(
                         {"error": "give a query, author, category or date"}, 400)
                     return
-                rerank = one("rerank", "0") in ("1", "true", "yes")
                 try:
-                    results, elapsed, warning = index.query(
+                    results, elapsed = index.query(
                         query, k, cats, since, author=author or None,
-                        rerank=rerank and bool(query), until=until)
+                        until=until)
                 except Exception as exc:  # surfaced in the UI, not swallowed
                     self._json({"error": str(exc)}, 500)
                     return
                 payload = {"results": results, "ms": round(elapsed * 1000),
-                           "ranked": "relevance" if query else "date",
-                           "reranked": bool(rerank and query and not warning)}
-                if warning:
-                    payload["warning"] = f"Reranker unavailable: {warning}"
+                           "ranked": "relevance" if query else "date"}
                 if query and not results:
                     # An empty relevance search is confusing while a build is
                     # running: the filters may match plenty of papers that
@@ -1222,16 +1186,11 @@ def make_handler(index: ResidentIndex, updater: Updater,
                     k = max(1, min(500, int(one("k", "20"))))
                 except ValueError:
                     k = 20
-                rerank = one("rerank", "0") in ("1", "true", "yes")
-                results, elapsed, warning = index.similar(paper_id, k, rerank)
+                results, elapsed = index.similar(paper_id, k)
                 if results is None:
                     self._json({"error": f"{paper_id} has no vector yet"}, 404)
                     return
-                payload = {"results": results, "ms": round(elapsed * 1000),
-                           "reranked": bool(rerank and not warning)}
-                if warning:
-                    payload["warning"] = f"Reranker unavailable: {warning}"
-                self._json(payload)
+                self._json({"results": results, "ms": round(elapsed * 1000)})
                 return
 
             self._send(b"not found", "text/plain", 404)
@@ -1559,11 +1518,9 @@ article {
   padding: 14px 16px; margin: 10px 0;
 }
 .top { display: flex; gap: 12px; align-items: baseline; }
-.scores { display: flex; flex-direction: column; gap: 3px; flex: none;
-          align-items: stretch; }
 /* Scores are diagnostics, not reading material: hidden unless asked for.
    Toggled by a class rather than re-rendering, so it costs no re-search. */
-body:not(.with-scores) .scores, body:not(.with-scores) .top > .score {
+body:not(.with-scores) .top > .score {
   display: none;
 }
 .score {
@@ -1571,13 +1528,6 @@ body:not(.with-scores) .scores, body:not(.with-scores) .top > .score {
   color: var(--accent); background: var(--accent-soft); padding: 2px 7px;
   border-radius: 5px; flex: none; text-align: center;
 }
-/* The cosine is context for the reranked score, so it reads as secondary. */
-.score.vec {
-  color: var(--muted); background: transparent;
-  border: 1px solid var(--line); font-weight: 500; font-size: 12px;
-}
-.score small { font-size: 9.5px; font-weight: 500; opacity: .75;
-               display: block; letter-spacing: .04em; }
 .title { font-size: 16.5px; font-weight: 600; margin: 0; line-height: 1.42; }
 .title a { color: inherit; text-decoration: none; }
 .title a:hover { text-decoration: underline; text-decoration-color: var(--accent); }
@@ -1633,7 +1583,6 @@ mark { background: var(--accent-soft); color: inherit; }
                         autocomplete="off"></label>
     <span>Categories:</span>
 <!--CATEGORIES-->
-<!--RERANK-->
     <label title="Show the relevance logit and cosine for each hit">
       <input type="checkbox" id="showscores"> Scores</label>
     <span class="dates">
@@ -1719,10 +1668,6 @@ counts in full, which favours papers near the middle of all of them.">
 <script src="/static/auto-render.min.js"></script>
 <script>
 const $ = s => document.querySelector(s);
-
-// The rerank checkbox exists only when the server can rerank, so every reader
-// of it goes through here rather than assuming the element is there.
-const reranking = () => { const b = $("#rerank"); return !!b && b.checked; };
 
 /* ---- LaTeX -------------------------------------------------------------
    arXiv metadata is raw LaTeX in two distinct flavours, and they need
@@ -1861,24 +1806,10 @@ function note(extra) {
   $("#embed").hidden = !(stats && stats.pending > 0) || running;
 }
 
-/* Reranked hits carry two scores on different scales, shown stacked so they can
-   be read against each other: the cross-encoder's log-odds (what the order is
-   based on) and the cosine the index started from (what it was before). A
-   result high on one and low on the other is exactly where reranking earned
-   its keep. Unreranked hits have only the cosine, and it needs no label. */
 function scoreBadges(p) {
   if (p.score == null) return "";
-  if (p.rerank_margin == null)
-    return '<span class="score" title="Cosine similarity of the embeddings, '
-         + '-1 to 1">' + p.score.toFixed(3) + "</span>";
-  return '<div class="scores">'
-       + '<span class="score" title="Cross-encoder log-odds that this answers '
-       + 'the query. Higher is better; the ordering is based on this.">'
-       + '<small>RERANK</small>' + p.rerank_margin.toFixed(2) + "</span>"
-       + '<span class="score vec" title="Cosine similarity from the embedding '
-       + 'index, before reranking.">'
-       + '<small>COS</small>' + p.vector_score.toFixed(3) + "</span>"
-       + "</div>";
+  return '<span class="score" title="Cosine similarity of the embeddings, '
+       + '-1 to 1">' + p.score.toFixed(3) + "</span>";
 }
 
 function card(p) {
@@ -1931,7 +1862,6 @@ function render(data, label) {
   const bits = [data.total && data.total > data.results.length
     ? `${data.results.length} of ${data.total} results in ${data.ms} ms`
     : `${data.results.length} results in ${data.ms} ms`];
-  if (data.reranked) bits.push("cross-encoder reranked");
   if (data.warning) bits.push(data.warning);
   if (label) bits.push(label);
   note(bits.join("  ·  "));
@@ -2242,8 +2172,6 @@ $("#f").onsubmit = e => {
   if (!q && !author && !since && !until && !cats.length) return;
   const p = new URLSearchParams({q, k: $("#k").value});
   if (author) p.set("author", author);
-  // The control is absent when the server cannot rerank, so ask it that way.
-  if (reranking() && q) p.set("rerank", "1");
   document.querySelectorAll(".cat:checked").forEach(c => p.append("cat", c.value));
   if ($("#since").value) p.set("since", $("#since").value);
   if ($("#until").value) p.set("until", $("#until").value);
@@ -2394,10 +2322,7 @@ embedBtn.onclick = async () => {
 pollUpdate();
 
 function similar(id, title) {
-  // Honour the same checkbox as search: the cross-encoder scores a text pair
-  // either way, with this paper's abstract standing in for the query.
-  const rr = reranking() ? "&rerank=1" : "";
-  run(`/api/similar?id=${encodeURIComponent(id)}&k=${$("#k").value}` + rr,
+  run(`/api/similar?id=${encodeURIComponent(id)}&k=${$("#k").value}`,
       "similar to " + deTeX(title).slice(0, 60));
 }
 </script>
@@ -2405,27 +2330,9 @@ function similar(id, title) {
 </html>
 """
 
-# Substituted into the page only when reranking could actually run. Offering a
-# checkbox that cannot work is worse than not offering one: it is ticked by
-# default, so the first search on a machine without torch pays for a 50-hit
-# shortlist and then explains itself in the status line. The JS treats the
-# control as optional throughout, so its absence just means no `rerank=1`.
-RERANK_CONTROL = """    <label title="Rescores the top 50 hits with a \
-cross-encoder that reads query and abstract together. Slower, better ordered.">
-      <input type="checkbox" id="rerank" checked> Rerank top 50</label>"""
-
-
 def page(categories) -> str:
-    """The UI, with a checkbox per category and the rerank control included
-    only if it is usable.
-
-    Rebuilt per request rather than cached: `offerable()` is cheap, and a
-    reranker that fails at run time -- an out-of-memory, a GPU that went away --
-    then stops being offered on the next refresh instead of at the next restart.
-    """
-    control = RERANK_CONTROL if rerank_mod.offerable() else ""
+    """The UI, with a checkbox per category."""
     boxes = "\n".join(
         f'    <label><input type="checkbox" class="cat" value="{c}"> '
         f"{c}</label>" for c in map(html.escape, categories))
-    return (PAGE.replace("<!--RERANK-->", control)
-            .replace("<!--CATEGORIES-->", boxes))
+    return PAGE.replace("<!--CATEGORIES-->", boxes)
