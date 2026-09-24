@@ -1,4 +1,4 @@
-# arXiv index
+<h1 align="center"><img src="docs/logo.svg" alt="arXiv index" width="360"></h1>
 
 A personalized search engine for arXiv, running entirely on your own machine.
 It looks up papers by meaning: describe what you are looking for in your own
