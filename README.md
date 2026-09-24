@@ -6,6 +6,8 @@ is one of yours, so cross-listed work counts. With the default math.AC, math.AG
 and math.CO that is ~145,000 papers and 747 MB of vectors; vector search takes
 ~210 ms, ~800 ms with reranking.
 
+![The web UI: a search for "toric degenerations of flag varieties", with the first result's abstract open](docs/screenshot.png)
+
 Day-to-day use is two commands:
 
 ```bash
