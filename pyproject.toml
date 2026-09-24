@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "arxiv_index"
+dynamic = ["version"]
+description = "A personalized semantic search engine for arXiv, running on your own machine"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = ["numpy", "ollama"]
+
+[project.optional-dependencies]
+# Search on the GPU; see GPU_SEARCH in config.py.
+gpu = ["torch"]
+
+[project.scripts]
+arxiv_index = "arxiv_index.__main__:main"
+
+[project.urls]
+Repository = "https://github.com/MattDupraz/arxiv_index"
+
+[tool.setuptools]
+packages = ["arxiv_index"]
+
+[tool.setuptools.dynamic]
+version = { attr = "arxiv_index.__version__" }
+
+[tool.setuptools.package-data]
+# The vendored KaTeX the web UI serves, so it works offline.
+arxiv_index = ["static/*.js", "static/*.css", "static/fonts/*"]

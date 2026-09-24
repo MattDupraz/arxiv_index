@@ -27,21 +27,21 @@ ollama pull qwen3-embedding:4b
 To use a different model, see [Another embedding model](#another-embedding-model)
 **before** building: an index cannot change model afterwards.
 
-**2. Get the code and its Python dependencies.** Python 3.11 or newer:
+**2. Install it.** Python 3.11 or newer:
 
 ```bash
 git clone https://github.com/MattDupraz/arxiv_index.git
-cd arxiv_index
-pip install numpy ollama
-pip install torch   # optional, see below
+pip install ./arxiv_index          # or ./arxiv_index[gpu], see below
 ```
 
-torch is optional and only helps with a GPU: it lets the web UI search on the
-GPU, which is faster. Without it everything works, on the CPU.
+This installs the `arxiv_index` command, which works from any directory, and
+the two dependencies, numpy and ollama. The `[gpu]` extra adds torch, which
+only helps with a GPU: it lets the web UI search on the GPU, which is faster.
+Without it everything works, on the CPU. To work on the code, `pip install -e`
+installs it so that edits take effect without reinstalling; and from the
+repository, `python3 -m arxiv_index` runs it without installing at all.
 
-Every command below is run from this directory.
-
-**The rest can be done in the browser.** Run `python3 -m arxiv_index serve`
+**The rest can be done in the browser.** Run `arxiv_index serve`
 now: with the index still empty, the page it opens is a first-time setup. It
 asks for your categories, then fills the index from the arXiv snapshot (step 3
 says where to get it) or from an index exported by another instance, taking up
@@ -49,7 +49,7 @@ that instance's settings too if it was exported with them, and shows the
 progress. The steps below do the same in a terminal.
 
 If you have an index exported from another machine, skip steps 3 and 4:
-`python3 -m arxiv_index import arxiv-index.tar` installs it (see
+`arxiv_index import arxiv_index.tar` installs it (see
 [Exporting and importing](#exporting-and-importing-an-index)).
 
 **3. Download the arXiv snapshot.** arXiv's API cannot page back far enough to
@@ -64,7 +64,7 @@ again.
 **4. Build the index**, giving it the snapshot:
 
 ```bash
-python3 -m arxiv_index build ~/Downloads/arxiv-metadata-oai-snapshot.json
+arxiv_index build ~/Downloads/arxiv-metadata-oai-snapshot.json
 ```
 
 It first asks which arXiv categories to cover, by their full names (`math.AG`,
@@ -77,7 +77,7 @@ It then scans the snapshot for those categories, which takes a couple of
 minutes, and embeds every paper. Embedding the default three categories'
 145,000 papers takes about three hours on a consumer GPU, and more categories
 take proportionally longer. It can be interrupted at any time, and
-`python3 -m arxiv_index build --embed-only` carries on where it stopped. The
+`arxiv_index build --embed-only` carries on where it stopped. The
 index takes about 6.3 KB of disk per paper, in `~/.arxiv_index/`.
 
 To embed at a better time, say overnight, add `--scan-only`: it imports the
@@ -91,14 +91,14 @@ of those can start the long run.
 everything posted since, from the arXiv API:
 
 ```bash
-python3 -m arxiv_index update
-python3 -m arxiv_index status    # what is in the index, and up to when
+arxiv_index update
+arxiv_index status    # what is in the index, and up to when
 ```
 
 **6. Start the web UI.**
 
 ```bash
-python3 -m arxiv_index serve     # opens http://127.0.0.1:8000/
+arxiv_index serve     # opens http://127.0.0.1:8000/
 ```
 
 Open the settings (the cog, top right) to add the authors you follow and
@@ -171,8 +171,8 @@ An index, embeddings included, can be written to one file and installed
 elsewhere, to back it up or to spare another machine the build:
 
 ```bash
-python3 -m arxiv_index export arxiv-index.tar    # about 6.3 KB per paper
-python3 -m arxiv_index import arxiv-index.tar    # on the other machine
+arxiv_index export arxiv_index.tar    # about 6.3 KB per paper
+arxiv_index import arxiv_index.tar    # on the other machine
 ```
 
 The file holds the papers and their embeddings. With `export --settings` it
@@ -222,7 +222,7 @@ can be rebuilt:
 ```bash
 sqlite3 ~/.arxiv_index/papers.db "UPDATE papers SET row = NULL"
 rm ~/.arxiv_index/vectors.f16
-python3 -m arxiv_index build --embed-only
+arxiv_index build --embed-only
 ```
 
 The reverse does not work: `vectors.f16` alone is anonymous numbers.
@@ -237,11 +237,11 @@ that automatically, and, on the machine running the server, importing and
 exporting.
 
 ```bash
-python3 -m arxiv_index search "toric degenerations of flag varieties"
-python3 -m arxiv_index search "chromatic polynomial" -k 20 --category math.CO
-python3 -m arxiv_index search "invariant theory of finite groups" --author Noether
-python3 -m arxiv_index search --author "Hardy, Littlewood"  # no query needed
-python3 -m arxiv_index similar 0704.0002
+arxiv_index search "toric degenerations of flag varieties"
+arxiv_index search "chromatic polynomial" -k 20 --category math.CO
+arxiv_index search "invariant theory of finite groups" --author Noether
+arxiv_index search --author "Hardy, Littlewood"  # no query needed
+arxiv_index similar 0704.0002
 ```
 
 **Scores are hidden by default** in both interfaces. The **Scores** checkbox and
@@ -311,7 +311,7 @@ paper in the database.
 ## Keeping it current
 
 ```bash
-python3 -m arxiv_index update
+arxiv_index update
 ```
 
 or the **Fetch new papers** button, which runs exactly this. It walks the arXiv
@@ -350,15 +350,16 @@ if a slot has passed and nothing has run since, the first run happens within the
 minute. Manual runs count, so **Fetch new papers** resets the clock.
 
 Changes take effect within 30 seconds, no restart needed. For updates without a
-server running, use cron:
+server running, use cron, giving the command's full path (`which
+arxiv_index`) if cron's `PATH` does not reach it:
 
 ```cron
-0 7 * * 1  cd /path/to/arxiv_index && python3 -m arxiv_index update >> update.log 2>&1
+0 7 * * 1  arxiv_index update >> ~/.arxiv_index/update.log 2>&1
 ```
 
 ## Commands
 
-`python3 -m arxiv_index <command>`; every command takes `--help`.
+`arxiv_index <command>`; every command takes `--help`.
 
 | | |
 |---|---|

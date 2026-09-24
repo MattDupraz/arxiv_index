@@ -1036,7 +1036,7 @@ def make_handler(index: ResidentIndex, updater: Updater,
                     self.send_header("Content-Length", str(ex.size))
                     self.send_header(
                         "Content-Disposition", "attachment; filename="
-                        f'"arxiv-index-{dt.date.today().isoformat()}.tar"')
+                        f'"arxiv_index-{dt.date.today().isoformat()}.tar"')
                     self.send_header("Cache-Control", "no-store")
                     self.end_headers()
                     try:

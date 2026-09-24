@@ -278,7 +278,7 @@ def main(argv=None) -> None:
     p = sub.add_parser("build", help="backfill from the Kaggle snapshot")
     p.add_argument("snapshot", nargs="?", type=Path,
                    help="arxiv-metadata-oai-snapshot.json; default: the "
-                        "one in the repo root")
+                        "one in the current directory")
     only = p.add_mutually_exclusive_group()
     only.add_argument("--scan-only", action="store_true",
                       help="import the papers from the snapshot; embed them "
@@ -339,7 +339,7 @@ def main(argv=None) -> None:
 
     p = sub.add_parser("export", help="write the index, embeddings included, "
                                       "to one file")
-    p.add_argument("file", type=Path, help="e.g. arxiv-index.tar")
+    p.add_argument("file", type=Path, help="e.g. arxiv_index.tar")
     p.add_argument("--settings", action="store_true",
                    help="include your settings: categories, profile, schedule")
     p.set_defaults(func=lambda args: transfer.export(args.file, args.settings))
