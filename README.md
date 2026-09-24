@@ -127,7 +127,7 @@ handing someone `papers.db` and `vectors.f16` does not hand them your profile.
 
 The profile and the automatic-update setting are stored here too, written by
 the web UI. Hand edits are picked up without a restart, except the two keys
-above, which `serve` reads when it starts.
+above, which `serve` reads once.
 
 ### Another embedding model
 

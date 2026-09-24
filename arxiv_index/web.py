@@ -26,7 +26,6 @@ import mimetypes
 import os
 import pathlib
 import signal
-import sys
 import threading
 import time
 import webbrowser
@@ -308,7 +307,7 @@ class ResidentIndex:
             "papers": total,
             "embedded": total - pending,
             "pending": pending,
-            "model": config.MODEL,
+            "model": config.model() if config.ready() else None,
             "categories": self.categories,
             "missing": self.missing,
         }
@@ -571,7 +570,6 @@ class Updater:
         self.kind = "update"        # update | embed | snapshot | index
         self.upload = None          # an import's _Upload
         self.imported = 0           # papers in scope, once a snapshot is read
-        self.restarting = None      # the model an import restarts the server with
         self.matched = 0            # the same, so far, while it is read
         self.lines = collections.deque(maxlen=self.KEEP_LINES)
         self.started = None
@@ -611,7 +609,6 @@ class Updater:
             self._categories = list(categories)
             self._take_settings = take_settings
             self.imported = self.matched = 0
-            self.restarting = None
             self.lines.clear()
             self.started = time.time()
             self.finished = None
@@ -689,22 +686,16 @@ class Updater:
 
     def _import_index(self) -> int:
         """Import the uploaded export. Into an empty index it brings its own
-        model and categories (see transfer.import_stream); a model other than
-        the one this server runs with needs a restart to take up."""
-        result = transfer.import_stream(
+        model and categories; see transfer.import_stream."""
+        transfer.import_stream(
             self.upload, self.upload.name, replace=self._mode == "replace",
             merge=self._mode == "merge", take_settings=self._take_settings,
             log=self._log, on_read=self.upload.finished)
-        if result["model_changed"]:
-            with self._lock:
-                self.restarting = result["model"]
-            # Long enough for a page polling once a second to see the run
-            # finish, and so know to wait for the server to come back.
-            threading.Thread(target=_restart, args=(result["model"], 3.0),
-                             daemon=True).start()
-        elif self._index is not None:
-            # The categories are the one setting the server fixes at start;
-            # the rest are read afresh wherever they are used.
+        if self._index is not None:
+            # A replaced index is a new file: open it before reloading.
+            self._index.refresh_if_stale()
+            # The categories are the one setting the server reads once; the
+            # rest are read afresh wherever they are used.
             self._index.set_categories(settings.categories())
         return 0
 
@@ -727,7 +718,6 @@ class Updater:
                 "lines": list(self.lines),
                 "embedded": self.embedded,
                 "imported": self.imported,
-                "restarting": self.restarting,
                 "error": self.error,
             }
             if self.started:
@@ -990,19 +980,13 @@ def make_handler(index: ResidentIndex, updater: Updater,
             self._json(updater.snapshot())
 
         def _choose_model(self, model) -> None:
-            """Set the embedding model of an index with no papers yet.
-
-            The model is read once, when the server starts, and its dimension
-            and the index's record of it follow from it; so rather than patch
-            all of that in place, the server records the choice and restarts
-            itself, which with the index empty costs nothing.
-            """
+            """Choose the embedding model of an index with no papers yet."""
             if not self._trusted():
                 self._json({"error": "Setting up is only offered on the "
                                      "machine running the server."}, 403)
                 return
-            if model == config.MODEL:
-                self._json({"model": model, "restarting": False})
+            if config.ready() and model == config.model():
+                self._json({"model": model})
                 return
             if index.stats()["papers"]:
                 self._json({"error": "The index already has papers, so its "
@@ -1019,13 +1003,10 @@ def make_handler(index: ResidentIndex, updater: Updater,
                                      "model."}, 400)
                 return
             # The default's prompts are known; another model gets none.
-            settings.update(embedding=(
-                {"model": model} if model == config.DEFAULT_EMBEDDING["model"]
-                else {"model": model, "dim": chosen["dim"]}))
-            with index._db_lock:
-                store.forget_embedding(index.db)
-            self._json({"model": model, "restarting": True})
-            threading.Thread(target=_restart, args=(model,), daemon=True).start()
+            config.use({"model": model}
+                       if model == config.DEFAULT_EMBEDDING["model"]
+                       else {"model": model, "dim": chosen["dim"]})
+            self._json({"model": model})
 
         def _export(self) -> None:
             """Stream the index out as an export, the same file `export` writes."""
@@ -1281,7 +1262,9 @@ def make_handler(index: ResidentIndex, updater: Updater,
                 except SystemExit as exc:
                     models, problem = [], str(exc)
                 self._json({"categories": index.categories,
-                            "model": config.MODEL, "models": models,
+                            "model": config.model() if config.ready() else None,
+                            "default": config.DEFAULT_EMBEDDING["model"],
+                            "models": models,
                             "ollama_error": problem,
                             "local": self._local(),
                             "papers": index.stats()["papers"]})
@@ -1481,17 +1464,6 @@ def _valid_date(text: str) -> bool:
         return False
 
 
-def _restart(model: str, delay: float = 0.5) -> None:
-    """Start this server again as the same command, once the answer that
-    announced it has gone out. The page waits for it to come back."""
-    time.sleep(delay)
-    print(f"\nRestarting with the embedding model {model} ...", flush=True)
-    argv = [sys.executable] + sys.orig_argv[1:]
-    if "--no-browser" not in argv:
-        argv.append("--no-browser")     # the page is already open
-    os.execv(sys.executable, argv)
-
-
 WATCH_INTERVAL = 5.0    # seconds between looks at the index for changes
 
 
@@ -1513,8 +1485,7 @@ def serve(port: int = 8000, host: str = "127.0.0.1", open_browser: bool = True):
     index = ResidentIndex()
     stats = index.stats()
     # Computed rather than read off the matrix, which is gone on the GPU path.
-    size = (len(index.ids) * config.DIM
-            * np.dtype(config.VEC_DTYPE).itemsize / 1e6)
+    size = len(index.ids) * config.slot_bytes() / 1e6 if index.ids else 0
     where = "VRAM" if index.gpu is not None else "RAM"
     print(f"{stats['embedded']:,} papers resident ({size:,.0f} MB in {where})"
           + (f", {stats['pending']:,} still embedding" if stats["pending"] else ""))
@@ -2939,7 +2910,7 @@ const bytes = n => n >= 1e9 ? (n / 1e9).toFixed(2) + " GB"
                             : Math.round(n / 1e6).toLocaleString() + " MB";
 const count = n => n.toLocaleString();
 let busy = false, uploading = false, timer = null;
-let current = null;     // the model the server is running with
+let current = null;     // the model chosen so far, if any
 
 function refresh() {
   const noModel = !$("#model").value;
@@ -2968,7 +2939,9 @@ async function init() {
     $("#model-err").textContent = s.ollama_error || "No embedding model is "
       + "installed. Run: ollama pull qwen3-embedding:4b, then reload this page.";
   else if (!s.models.some(m => m.name === s.model))
-    $("#model").value = s.models[0].name;
+    // Nothing chosen yet: offer the default if it is installed.
+    $("#model").value = s.models.some(m => m.name === s.default)
+      ? s.default : s.models[0].name;
   refresh();
   // A reload in the middle of an import picks the run up, not a second one.
   const u = await (await fetch("/api/update")).json();
@@ -3018,24 +2991,6 @@ async function poll() {
   catch (e) { /* transient; the next tick asks again */ }
 }
 
-/* An export with another model restarts the server once it is in; the page
-   says so, and shows the result when the server answers with that model. */
-async function awaitRestart(model) {
-  $("#p-title").textContent = "Switching model";
-  $("#p-text").textContent = `The export uses ${model}; restarting the server `
-    + "with it…";
-  for (let i = 0; i < 120; i++) {
-    await new Promise(done => setTimeout(done, 500));
-    try {
-      const now = await (await fetch("/api/setup")).json();
-      if (now.model === model) return true;
-    } catch (e) { /* still restarting */ }
-  }
-  $("#p-err").textContent = "The server did not come back; check the "
-    + "terminal running it.";
-  return false;
-}
-
 function render(s) {
   // Until the upload's request has been taken up, an idle answer is stale.
   if (uploading && s.state !== "running") return;
@@ -3066,24 +3021,7 @@ function render(s) {
     $("#p-err").textContent = s.error || "unknown error";
     return;
   }
-  if (s.state === "idle") {
-    // A server restarted since, which remembers no run: the index says
-    // whether the import went in.
-    fetch("/api/setup").then(r => r.json()).then(now => {
-      if (!now.papers) return;
-      setBar(1);
-      $("#p-title").textContent = "Done";
-      $("#p-text").textContent = `The index is in place, with ${now.model}.`;
-      $("#p-done").hidden = false;
-    });
-    return;
-  }
   if (s.state !== "done") return;
-  if (s.restarting) {
-    const settled = {...s, restarting: null};
-    awaitRestart(s.restarting).then(ok => { if (ok) render(settled); });
-    return;
-  }
   setBar(1);
   if (s.kind === "snapshot" && !s.imported) {
     $("#p-title").textContent = "Nothing imported";
@@ -3112,8 +3050,6 @@ function render(s) {
   $("#p-done").hidden = false;
 }
 
-/* A different model restarts the server with it (see _choose_model), so
-   wait for it to come back before sending anything. */
 async function ensureModel() {
   const want = $("#model").value;
   $("#model-err").textContent = "";
@@ -3123,19 +3059,8 @@ async function ensureModel() {
     body: JSON.stringify({model: want})});
   const s = await r.json();
   if (!r.ok) { $("#model-err").textContent = s.error; return false; }
-  $("#s3").hidden = false;
-  $("#p-title").textContent = "Switching model";
-  $("#p-text").textContent = `Restarting the server with ${want}…`;
-  for (let i = 0; i < 120; i++) {
-    await new Promise(done => setTimeout(done, 500));
-    try {
-      const now = await (await fetch("/api/setup")).json();
-      if (now.model === want) { current = want; return true; }
-    } catch (e) { /* still restarting */ }
-  }
-  $("#model-err").textContent = "The server did not come back; check the "
-    + "terminal running it.";
-  return false;
+  current = want;
+  return true;
 }
 
 async function upload(kind, file, params) {

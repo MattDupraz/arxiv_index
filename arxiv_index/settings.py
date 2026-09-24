@@ -28,11 +28,12 @@ Every key is optional.
 JSON rather than TOML because the web UI writes the profile back, and the
 standard library can read TOML but not write it. The file is re-read on every
 use, so a hand edit is picked up without a restart -- except `categories` and
-`embedding`, which a running server fixes at start.
+`embedding`, which a running server reads once.
 
 `embedding` is the odd one out: it describes the index rather than the reader,
 and has to name the model the index was built with; `store.check_model`
-refuses anything else.
+refuses anything else. It is written when the model is chosen, on setting up;
+without it, the model is the one the index recorded (see config.embedding).
 
 The embeddings of the interests are *not* kept here: 10 KB of base64 per entry
 would bury the text someone may want to edit by hand. They go in a cache keyed

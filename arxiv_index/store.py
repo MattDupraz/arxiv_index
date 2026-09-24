@@ -59,33 +59,29 @@ def connect(check_same_thread: bool = True) -> sqlite3.Connection:
     # turn rather than fail outright.
     db.execute("PRAGMA busy_timeout=10000")
     db.executescript(SCHEMA)
-    # What the vectors are made with, recorded once when the index is created
-    # and checked ever after; see check_model.
-    for key, value in _embedding():
-        db.execute("INSERT OR IGNORE INTO meta VALUES (?, ?)", (key, value))
-    db.commit()
     return db
 
 
 def _embedding():
     """The settings that make vectors comparable, as they are recorded."""
-    return (("model", config.MODEL), ("dim", str(config.DIM)),
-            ("document_prefix", config.DOCUMENT_PREFIX))
+    e = config.embedding()
+    return (("model", e["model"]), ("dim", str(e["dim"])),
+            ("document_prefix", e["document_prefix"]))
 
 
-def forget_embedding(db: sqlite3.Connection) -> None:
-    """Drop the recorded model of an index with no papers yet, so that the
-    next start records the one the settings name instead."""
-    if count_papers(db):
-        raise SystemExit("The index has papers; its model cannot change.")
-    db.execute("DELETE FROM meta WHERE key IN ('model', 'dim', "
-               "'document_prefix')")
-    db.commit()
+def record(db: sqlite3.Connection) -> None:
+    """Record what the vectors are made with, if not yet recorded: when the
+    first one is written, which is when the index takes on a model. Checked
+    ever after; see check_model."""
+    db.executemany("INSERT OR IGNORE INTO meta VALUES (?, ?)", _embedding())
 
 
 def embedding_mismatch(meta: dict):
     """The first recorded (key, stored, current) that disagrees with the
-    settings, or None. `meta` is an index's meta table."""
+    settings, or None. `meta` is an index's meta table. An index that has
+    recorded no model yet has nothing to disagree with."""
+    if "model" not in meta:
+        return None
     for key, current in _embedding():
         if meta.get(key) is not None and meta[key] != current:
             return key, meta[key], current
@@ -199,21 +195,20 @@ def pending_batches(db: sqlite3.Connection, size: int):
 
 # --- Vectors ----------------------------------------------------------------
 
-SLOT_BYTES = config.DIM * np.dtype(config.VEC_DTYPE).itemsize
-
 
 def vector_count() -> int:
     """Number of slots currently in the vector file."""
     if not config.VEC_PATH.exists():
         return 0
-    return config.VEC_PATH.stat().st_size // SLOT_BYTES
+    return config.VEC_PATH.stat().st_size // config.slot_bytes()
 
 
 def read_vector(slot: int) -> np.ndarray:
     """One stored vector, as float32."""
+    size = config.slot_bytes()
     with open(config.VEC_PATH, "rb") as fh:
-        fh.seek(slot * SLOT_BYTES)
-        data = fh.read(SLOT_BYTES)
+        fh.seek(slot * size)
+        data = fh.read(size)
     return np.frombuffer(data, dtype=config.VEC_DTYPE).astype(np.float32)
 
 
@@ -233,8 +228,9 @@ def append_vectors(db: sqlite3.Connection, ids, vectors: np.ndarray) -> None:
     at vectors that were never written.
     """
     vectors = normalise(vectors)
-    if vectors.shape != (len(ids), config.DIM):
-        raise ValueError(f"expected {(len(ids), config.DIM)}, got {vectors.shape}")
+    if vectors.shape != (len(ids), config.dim()):
+        raise ValueError(f"expected {(len(ids), config.dim())}, "
+                         f"got {vectors.shape}")
 
     start = vector_count()
     config.INDEX_DIR.mkdir(parents=True, exist_ok=True)
@@ -247,6 +243,7 @@ def append_vectors(db: sqlite3.Connection, ids, vectors: np.ndarray) -> None:
         "UPDATE papers SET row = ?, embedded_at = ? WHERE id = ?",
         [(start + i, now, pid) for i, pid in enumerate(ids)],
     )
+    record(db)
     db.commit()
 
 
@@ -270,7 +267,9 @@ def load_matrix(db: sqlite3.Connection, where: str = None, params=(),
     if keep_ids is not None:
         rows = [r for r in rows if r["id"] in keep_ids]
     if not rows:
-        return np.empty((0, config.DIM), dtype=config.VEC_DTYPE), []
+        # No vectors yet, so perhaps no model either: an empty matrix is empty
+        # whatever its width.
+        return np.empty((0, 0), dtype=config.VEC_DTYPE), []
 
     slots = np.fromiter((r["row"] for r in rows), dtype=np.int64, count=len(rows))
     ids = [r["id"] for r in rows]
@@ -283,7 +282,7 @@ def load_matrix(db: sqlite3.Connection, where: str = None, params=(),
         )
 
     mm = np.memmap(config.VEC_PATH, dtype=config.VEC_DTYPE, mode="r",
-                   shape=(total, config.DIM))
+                   shape=(total, config.dim()))
     # Contiguous run is the common case (no revisions yet) and avoids a copy.
     if len(slots) == total and slots[0] == 0 and slots[-1] == total - 1:
         return mm, ids

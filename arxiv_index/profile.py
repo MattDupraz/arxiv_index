@@ -57,7 +57,6 @@ DEFAULT_BLEND = 0.35
 # not the corpus's float16: this is the query side, which the search path keeps
 # in float32 throughout.
 VECTOR_DTYPE = "<f4"
-VECTOR_BYTES = config.DIM * np.dtype(VECTOR_DTYPE).itemsize
 
 
 def clean_authors(raw) -> list:
@@ -172,7 +171,7 @@ def _decode(raw):
     """One stored base64 vector as a unit float32 array, or None.
 
     Returns None rather than raising on anything unexpected -- absent, damaged,
-    or the wrong length because config.DIM changed. Every caller treats "no
+    or the wrong length because the model changed. Every caller treats "no
     vector" as "this entry cannot be ranked by yet", which is the right answer
     in all three cases, and saving the profile again rebuilds it.
     """
@@ -182,7 +181,7 @@ def _decode(raw):
         buf = base64.b64decode(raw, validate=True)
     except (ValueError, binascii.Error):
         return None
-    if len(buf) != VECTOR_BYTES:
+    if len(buf) != config.dim() * np.dtype(VECTOR_DTYPE).itemsize:
         return None
     return np.frombuffer(buf, dtype=VECTOR_DTYPE)
 
@@ -198,7 +197,7 @@ def _interests() -> list:
 
 
 def _cache() -> dict:
-    return settings.read_vector_cache(config.QUERY_EMBEDDER)
+    return settings.read_vector_cache(config.query_embedder())
 
 
 def load() -> dict:
@@ -271,9 +270,11 @@ def embed_missing(prune: bool = False) -> list:
         except Exception as exc:  # noqa: BLE001 - Ollama down, model missing
             failures.append(str(exc) or exc.__class__.__name__)
             continue
-        settings.merge_vector_cache(config.QUERY_EMBEDDER, {text: _encode(unit)})
+        settings.merge_vector_cache(config.query_embedder(),
+                                    {text: _encode(unit)})
     if prune:
-        settings.merge_vector_cache(config.QUERY_EMBEDDER, {}, keep=set(wanted))
+        settings.merge_vector_cache(config.query_embedder(), {},
+                                    keep=set(wanted))
     return failures
 
 

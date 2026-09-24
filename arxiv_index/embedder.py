@@ -19,15 +19,16 @@ def embed(texts, *, retries: int = 4, options=None) -> np.ndarray:
     a short backoff is enough to ride that out. Retries are safe because
     embedding is a pure function of the input.
     """
+    model, dim = config.model(), config.dim()
     if not texts:
-        return np.empty((0, config.DIM), dtype=np.float32)
+        return np.empty((0, dim), dtype=np.float32)
 
     options = options if options is not None else config.OLLAMA_OPTIONS
     last = None
     for attempt in range(retries):
         try:
             response = ollama.embed(
-                model=config.MODEL,
+                model=model,
                 input=list(texts),
                 options=options,
                 truncate=True,
@@ -43,13 +44,12 @@ def embed(texts, *, retries: int = 4, options=None) -> np.ndarray:
 
     # Outside the retries: a wrong dimension is a setting, not a hiccup.
     vectors = np.asarray(response.embeddings, dtype=np.float32)
-    if vectors.ndim == 2 and vectors.shape[1] != config.DIM:
+    if vectors.ndim == 2 and vectors.shape[1] != dim:
         raise EmbedError(
-            f"{config.MODEL} gives {vectors.shape[1]} dimensions, but "
-            f'"embedding.dim" is {config.DIM}. Correct it in {settings.path()}.')
-    if vectors.shape != (len(texts), config.DIM):
-        raise EmbedError(
-            f"expected {(len(texts), config.DIM)}, got {vectors.shape}")
+            f"{model} gives {vectors.shape[1]} dimensions, but "
+            f'"embedding.dim" is {dim}. Correct it in {settings.path()}.')
+    if vectors.shape != (len(texts), dim):
+        raise EmbedError(f"expected {(len(texts), dim)}, got {vectors.shape}")
     return vectors
 
 
@@ -99,8 +99,8 @@ def check_available() -> None:
         raise SystemExit(
             f"Cannot reach Ollama ({exc}). Is the service running?"
         ) from exc
-    if config.MODEL not in names:
+    if config.model() not in names:
         raise SystemExit(
-            f"Model {config.MODEL!r} is not available. Pull it with:\n"
-            f"    ollama pull {config.MODEL}"
+            f"Model {config.model()!r} is not available. Pull it with:\n"
+            f"    ollama pull {config.model()}"
         )

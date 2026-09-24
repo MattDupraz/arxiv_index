@@ -163,8 +163,8 @@ def import_stream(fileobj, source: str, replace: bool = False,
     before anything has been replaced. So do settings that cannot be used,
     when they were asked for.
 
-    Returns {"settings": taken up, "model": the embedding model the settings
-    now name, "model_changed": whether that differs from this process's}.
+    Returns {"settings": whether its settings were taken up, "model": the
+    embedding model the index now uses}.
     """
     fresh = _is_empty()
     existing = config.DB_PATH.exists()
@@ -215,11 +215,9 @@ def import_stream(fileobj, source: str, replace: bool = False,
         elif has_settings:
             log(f"{source} also holds its settings; they were left out, "
                 "and yours are unchanged.")
-        model = config.MODEL
         if fresh:
-            model = _adopt(embedding, None if taking else held, log)
-        return {"settings": taking, "model": model,
-                "model_changed": model != config.MODEL}
+            _adopt(embedding, None if taking else held, log)
+        return {"settings": taking, "model": config.model()}
     finally:
         for path in staged.values():
             path.unlink(missing_ok=True)
@@ -265,7 +263,7 @@ def _check(staged, source, adopt: bool = False) -> dict:
     vectors = staged["vectors.f16"]
     size = vectors.stat().st_size if vectors.exists() else 0
     try:
-        dim = int(meta.get("dim") or config.DIM)
+        dim = int(meta.get("dim") or config.DEFAULT_EMBEDDING["dim"])
     except ValueError:
         raise SystemExit(f"{source} is damaged: its dim is not a number.")
     width = dim * np.dtype(config.VEC_DTYPE).itemsize
@@ -315,14 +313,12 @@ def _held_categories(db_path) -> list:
         db.close()
 
 
-def _adopt(embedding: dict, categories, log) -> str:
-    """Name the imported index's model in the settings, and its categories
-    unless its settings were taken up with their own. Returns the model."""
-    values = {"embedding": embedding}
+def _adopt(embedding: dict, categories, log) -> None:
+    """Use the imported index's model, naming it in the settings, and its
+    categories unless its settings were taken up with their own."""
     if categories:
-        values["categories"] = categories
-    settings.update(**values)
-    model = embedding["model"]
+        settings.update(categories=categories)
+    model = config.use(embedding)["model"]
     log(f"This index now uses the embedding model {model}"
         + (f", and covers {', '.join(categories)}." if categories else "."))
     try:
@@ -332,7 +328,6 @@ def _adopt(embedding: dict, categories, log) -> str:
     if installed is not None and model not in installed:
         log(f"{model} is not installed in Ollama; searching needs it: "
             f"ollama pull {model}")
-    return model
 
 
 def _check_settings(path, source, adopt: bool = False) -> None:
@@ -354,11 +349,11 @@ def _check_settings(path, source, adopt: bool = False) -> None:
         theirs = settings.embedding(config.DEFAULT_EMBEDDING, data, where)
     except settings.SettingsError as exc:
         raise SystemExit(str(exc))
-    if not adopt and theirs != config.EMBEDDING:
+    if not adopt and theirs != config.embedding():
         raise SystemExit(
             f"The settings in {source} name the embedding model "
             f"{theirs['model']!r}, but this index is searched with "
-            f"{config.MODEL!r}. Import without taking its settings.")
+            f"{config.model()!r}. Import without taking its settings.")
 
 
 def _take_settings(staged, log) -> None:
@@ -414,10 +409,10 @@ def _merge(staged, batch: int = 5000, log=print) -> None:
     store.check_model(db)
     theirs = sqlite3.connect(staged["papers.db"])
     theirs.row_factory = sqlite3.Row
-    slots = (staged["vectors.f16"].stat().st_size // store.SLOT_BYTES
+    slots = (staged["vectors.f16"].stat().st_size // config.slot_bytes()
              if staged["vectors.f16"].exists() else 0)
     source = (np.memmap(staged["vectors.f16"], dtype=config.VEC_DTYPE,
-                        mode="r", shape=(slots, config.DIM)) if slots else None)
+                        mode="r", shape=(slots, config.dim())) if slots else None)
 
     with ingest.embed_lock():
         ours = {r["id"]: (_key(r), r["row"] is not None) for r in db.execute(
@@ -456,6 +451,7 @@ def _merge(staged, batch: int = 5000, log=print) -> None:
                     flush(fh)
             if pending:
                 flush(fh)
+        store.record(db)
         db.commit()
 
         mine, others = update_mod.cursors(db), update_mod.cursors(theirs)

@@ -4,13 +4,15 @@ What differs between the people using it -- which arXiv categories, their
 profile -- is in their own settings file; see settings.py.
 """
 
+import sqlite3
 from pathlib import Path
 
 from . import settings
 
 # --- Embedding model --------------------------------------------------------
-# The default, which the numbers below were measured with. The settings file's
-# `embedding` can name another Ollama model; see settings.embedding.
+# The default, which the numbers below were measured with, and the one offered
+# first. The settings file's `embedding` names the model in use; see
+# embedding() for where it comes from when it does not.
 #
 # Documents are embedded raw. Queries get the Qwen3-Embedding instruct prefix,
 # which is what the model was trained to expect on the query side.
@@ -22,14 +24,86 @@ DEFAULT_EMBEDDING = {
     "document_prefix": "",
 }
 
-EMBEDDING = settings.embedding(DEFAULT_EMBEDDING)
-MODEL = EMBEDDING["model"]
-DIM = EMBEDDING["dim"]
-QUERY_PREFIX = EMBEDDING["query_prefix"]
-DOCUMENT_PREFIX = EMBEDDING["document_prefix"]
 
-# What an embedded query depends on, so caches of them can tell when it changes.
-QUERY_EMBEDDER = {"model": MODEL, "query_prefix": QUERY_PREFIX}
+class NoModel(settings.SettingsError):
+    """No embedding model has been chosen for this index yet."""
+
+
+_embedding = None
+
+
+def embedding() -> dict:
+    """The embedding model, its dimension and its prefixes.
+
+    Worked out when first needed rather than at import, because a fresh
+    install has none: the model is chosen when the index is set up, by
+    `build` or on the setup page, and until then there is nothing to assume.
+    It comes from the settings if they name one, and otherwise from the index,
+    which records the model its vectors were made with (see store.record).
+    """
+    global _embedding
+    if _embedding is None:
+        if "embedding" in settings.load():
+            _embedding = settings.embedding(DEFAULT_EMBEDDING)
+        else:
+            _embedding = _recorded()
+        if _embedding is None:
+            raise NoModel("No embedding model has been chosen yet. Run `build`, "
+                          "or open the setup page `serve` shows.")
+    return _embedding
+
+
+def ready() -> bool:
+    """Whether an embedding model has been chosen."""
+    try:
+        embedding()
+    except NoModel:
+        return False
+    return True
+
+
+def use(entry: dict) -> dict:
+    """Name `entry` as the model in the settings, and use it from now on."""
+    global _embedding
+    settings.update(embedding=entry)
+    _embedding = None
+    return embedding()
+
+
+def _recorded():
+    """The model the index's vectors were made with, if it has any."""
+    if not DB_PATH.exists():
+        return None
+    db = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
+    try:
+        meta = dict(db.execute("SELECT key, value FROM meta WHERE key IN "
+                               "('model', 'dim', 'document_prefix')"))
+    except sqlite3.DatabaseError:
+        return None
+    finally:
+        db.close()
+    if "model" not in meta:
+        return None
+    default = meta["model"] == DEFAULT_EMBEDDING["model"]
+    return {"model": meta["model"],
+            "dim": int(meta.get("dim") or DEFAULT_EMBEDDING["dim"]),
+            "query_prefix": DEFAULT_EMBEDDING["query_prefix"] if default else "",
+            "document_prefix": meta.get("document_prefix", "")}
+
+
+def model() -> str:
+    return embedding()["model"]
+
+
+def dim() -> int:
+    return embedding()["dim"]
+
+
+def query_embedder() -> dict:
+    """What an embedded query depends on, so caches of them can tell when it
+    changes."""
+    e = embedding()
+    return {"model": e["model"], "query_prefix": e["query_prefix"]}
 
 # Ollama runtime options for indexing.
 #   num_ctx    abstracts top out around ~500 tokens; 2048 is generous headroom.
@@ -77,6 +151,11 @@ VEC_PATH = INDEX_DIR / "vectors.f16"
 VEC_DTYPE = "float16"
 
 
+def slot_bytes() -> int:
+    """Bytes per stored vector: two per float16."""
+    return dim() * 2
+
+
 def document_text(title: str, abstract: str) -> str:
     """The text that gets embedded for a paper. Title first, then abstract.
 
@@ -85,12 +164,12 @@ def document_text(title: str, abstract: str) -> str:
     """
     title = " ".join(title.split())
     abstract = " ".join(abstract.split())
-    return f"{DOCUMENT_PREFIX}{title}\n\n{abstract}"
+    return f"{embedding()['document_prefix']}{title}\n\n{abstract}"
 
 
 def query_text(query: str) -> str:
     """The text that gets embedded for a search query."""
-    return f"{QUERY_PREFIX}{query.strip()}"
+    return f"{embedding()['query_prefix']}{query.strip()}"
 
 
 def in_scope(categories: str, scope) -> bool:

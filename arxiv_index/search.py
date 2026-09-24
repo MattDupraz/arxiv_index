@@ -10,7 +10,7 @@ import functools
 
 import numpy as np
 
-from . import embedder, store, textnorm
+from . import config, embedder, store, textnorm
 
 # Rows scored per pass. Bounds the float32 working copy to a few hundred MB
 # regardless of how large the corpus grows.
@@ -123,9 +123,9 @@ def search(db, query: str, k: int = 10, categories=None, since: str = None,
     return [found[ids[i]] | {"score": float(scores[i])} for i in best]
 
 
-@functools.lru_cache(maxsize=512)
 def embed_query_normalised(query: str) -> np.ndarray:
-    """Unit-length embedding of a query, cached.
+    """Unit-length embedding of a query, cached per query and model -- the
+    model because the setup page chooses one in a running server.
 
     Normalising keeps scores in [-1, 1] so they read as genuine cosines.
 
@@ -139,6 +139,11 @@ def embed_query_normalised(query: str) -> np.ndarray:
     load). That is a nicety rather than a fix: papers within 3e-3 of cosine are
     ties, and either order is as good.
     """
+    return _query_vector(query, config.model())
+
+
+@functools.lru_cache(maxsize=512)
+def _query_vector(query: str, model: str) -> np.ndarray:
     vector = embedder.embed_query(query)
     unit = (vector / (np.linalg.norm(vector) or 1.0)).astype(np.float32)
     # Shared between callers, so freeze it rather than trust everyone.

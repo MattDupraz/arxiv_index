@@ -148,7 +148,7 @@ def embed_pending(db, batch_size: int = None, log=print, progress=None) -> int:
         return 0
 
     embedder.check_available()
-    log(f"Embedding {total:,} papers with {config.MODEL} ...")
+    log(f"Embedding {total:,} papers with {config.model()} ...")
     done = 0
     started = time.monotonic()
 

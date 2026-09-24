@@ -8,8 +8,8 @@ from pathlib import Path
 
 import numpy as np
 
-from . import (config, ingest, search as search_mod, settings, store,
-               textnorm, transfer, update as update_mod)
+from . import (config, embedder, ingest, search as search_mod, settings,
+               store, textnorm, transfer, update as update_mod)
 
 
 # --- Output -----------------------------------------------------------------
@@ -47,26 +47,65 @@ def print_results(results, full: bool = False, scores: bool = False) -> None:
 # --- Commands ---------------------------------------------------------------
 
 
-def ask_categories() -> None:
-    """On a first build, ask which categories to index and save the answer.
+def ask_setup() -> None:
+    """On a first build, ask for the categories and the embedding model, and
+    save the answers.
 
-    Only when the settings name none yet and someone is at the terminal: run
-    from a script, the build takes the defaults as it always has, and a
-    settings file that names them is never second-guessed.
+    Each is asked only when not yet chosen. With no one at the terminal the
+    defaults are taken, and a choice already made is never second-guessed.
     """
-    if "categories" in settings.load() or not sys.stdin.isatty():
-        return
+    interactive = sys.stdin.isatty()
+    if interactive and "categories" not in settings.load():
+        ask_categories()
+    if not config.ready():
+        if interactive:
+            ask_model()
+        else:
+            config.use({"model": config.DEFAULT_EMBEDDING["model"]})
+
+
+def _ask(prompt: str) -> str:
+    try:
+        return input(prompt)
+    except (EOFError, KeyboardInterrupt):
+        print()
+        raise SystemExit(1)
+
+
+def ask_model() -> None:
+    """Choose the embedding model from those installed in Ollama."""
+    models = embedder.embedding_models()
+    default = config.DEFAULT_EMBEDDING["model"]
+    if not models:
+        raise SystemExit("No embedding model is installed in Ollama. Pull one, "
+                         f"e.g.: ollama pull {default}")
+    names = [m["name"] for m in models]
+    suggested = default if default in names else names[0]
+    print("Which embedding model should the index use? It keeps it for good.")
+    for i, m in enumerate(models, 1):
+        print(f"  {i}. {m['name']}  ({m['dim']:,} dimensions)")
+    while True:
+        answer = _ask(f"Model [{suggested}]: ").strip() or suggested
+        if answer.isdigit() and 1 <= int(answer) <= len(models):
+            answer = names[int(answer) - 1]
+        chosen = next((m for m in models if m["name"] == answer), None)
+        if chosen:
+            break
+        print(f"{answer} is not one of these. Try again.")
+    config.use({"model": answer} if answer == default
+               else {"model": answer, "dim": chosen["dim"]})
+    print(f"Saved to {settings.path()}.\n")
+
+
+def ask_categories() -> None:
+    """Ask which categories to index, and save the answer."""
     default = " ".join(settings.DEFAULT_CATEGORIES)
     print("Which arXiv categories should the index cover? Give their full "
           "names,\nseparated by spaces or commas, e.g. math.AG hep-th cs.LG "
           "(the list is at\nhttps://arxiv.org/category_taxonomy). More "
           "categories make a longer build.\n")
     while True:
-        try:
-            answer = input(f"Categories [{default}]: ")
-        except (EOFError, KeyboardInterrupt):
-            print()
-            raise SystemExit(1)
+        answer = _ask(f"Categories [{default}]: ")
         try:
             chosen = settings.parse_categories(answer)
             break
@@ -88,7 +127,7 @@ def cmd_build(args) -> None:
         # Before asking for categories, not after.
         raise SystemExit(f"Snapshot not found at {snapshot}")
     if not args.embed_only:
-        ask_categories()
+        ask_setup()
         # Only the categories the index does not hold yet. The rest are kept
         # current by `update`, and the snapshot's copies would be older.
         missing = update_mod.missing(db)
@@ -178,8 +217,9 @@ def cmd_status(args, db=None) -> None:
     print(f"\nSettings:   {settings.path()}"
           + ("" if settings.path().exists() else "  (not created yet)"))
     print(f"Index:      {config.INDEX_DIR}")
-    print(f"Model:      {store.get_meta(db, 'model')} ({config.DIM} dims, "
-          f"{config.VEC_DTYPE})")
+    print("Model:      " + (f"{config.model()} ({config.dim()} dims, "
+                             f"{config.VEC_DTYPE})" if config.ready()
+                             else "not chosen yet"))
     print(f"Papers:     {total:,}   embedded {total - pending:,}, "
           f"pending {pending:,}")
     print(f"Vectors:    {slots:,} slots, {size:,.0f} MB"
@@ -226,7 +266,7 @@ def cmd_compact(args) -> None:
         return
 
     mm = np.memmap(config.VEC_PATH, dtype=config.VEC_DTYPE, mode="r",
-                   shape=(slots, config.DIM))
+                   shape=(slots, config.dim()))
     tmp = config.VEC_PATH.with_suffix(".compacting")
     with open(tmp, "wb") as fh:
         for start in range(0, len(rows), 8192):
@@ -243,7 +283,8 @@ def cmd_compact(args) -> None:
     tmp.replace(config.VEC_PATH)
     db.commit()
     print(f"Compacted {slots:,} -> {len(rows):,} slots "
-          f"({(slots - len(rows)) * store.SLOT_BYTES / 1e6:.0f} MB reclaimed).")
+          f"({(slots - len(rows)) * config.slot_bytes() / 1e6:.0f} MB "
+          "reclaimed).")
 
 
 # --- Argument parsing -------------------------------------------------------
