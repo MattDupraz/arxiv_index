@@ -1,8 +1,10 @@
 """How the index is built: the model, the tuning, the measurements behind them.
 
-What differs between the people using it -- which arXiv categories, where the
-index lives, their profile -- is in their own settings file; see settings.py.
+What differs between the people using it -- which arXiv categories, their
+profile -- is in their own settings file; see settings.py.
 """
+
+from pathlib import Path
 
 from . import settings
 
@@ -136,10 +138,10 @@ GPU_SEARCH = True
 BATCH_SIZE = 64
 
 # --- Storage ----------------------------------------------------------------
-# The index is ~/.arxiv_index or $ARXIV_INDEX_DIR; the snapshot comes from the
-# reader's settings, defaulting to the repo root.
-ROOT = settings.ROOT
-SNAPSHOT = settings.snapshot()
+# The index is ~/.arxiv_index or $ARXIV_INDEX_DIR. The snapshot is whatever
+# `build` is given, else this.
+ROOT = Path(__file__).resolve().parent.parent
+SNAPSHOT = ROOT / "arxiv-metadata-oai-snapshot.json"
 INDEX_DIR = settings.index_dir()
 DB_PATH = INDEX_DIR / "papers.db"
 VEC_PATH = INDEX_DIR / "vectors.f16"

@@ -48,16 +48,15 @@ Every command below is run from this directory.
 fetch the whole history, so the index is first filled from Kaggle's copy of
 arXiv's metadata:
 [kaggle.com/datasets/Cornell-University/arxiv](https://www.kaggle.com/datasets/Cornell-University/arxiv)
-(a free Kaggle account is needed). Unzip `arxiv-metadata-oai-snapshot.json`,
-about 5.5 GB, into this directory, or put it anywhere and set `"snapshot"` in
-`~/.arxiv_index/config.json` to its path (see [Settings](#settings)). It is
-needed only for the build and can be deleted afterwards, though adding a
-category later needs it again.
+(a free Kaggle account is needed), and unzip it anywhere. The file inside,
+`arxiv-metadata-oai-snapshot.json`, is about 5.5 GB. It is needed only for the
+build and can be deleted afterwards, though adding a category later needs it
+again.
 
-**4. Build the index.**
+**4. Build the index**, giving it the snapshot:
 
 ```bash
-python3 -m arxiv_index build
+python3 -m arxiv_index build ~/Downloads/arxiv-metadata-oai-snapshot.json
 ```
 
 It first asks which arXiv categories to cover, by their full names (`math.AG`,
@@ -67,11 +66,18 @@ saved in `~/.arxiv_index/config.json`, where you can change it later (see
 [Adding a category](#adding-a-category)).
 
 It then scans the snapshot for those categories, which takes a couple of
-minutes, and embeds every paper. Embedding the default three categories' 145,000 papers
-takes about three hours on a consumer GPU, and more categories take
-proportionally longer. It can be interrupted at any time, and
+minutes, and embeds every paper. Embedding the default three categories'
+145,000 papers takes about three hours on a consumer GPU, and more categories
+take proportionally longer. It can be interrupted at any time, and
 `python3 -m arxiv_index build --embed-only` carries on where it stopped. The
 index takes about 6.3 KB of disk per paper, in `~/.arxiv_index/`.
+
+To embed at a better time, say overnight, add `--scan-only`: it imports the
+papers and stops. Embed them later with `build --embed-only`, or with
+**Embed them now** in the web UI, shown beside the count of papers not yet
+embedded. Until then they can be listed by author but not found by searches.
+The next `update` embeds them too, and so does **Fetch new papers**, so either
+of those can start the long run.
 
 **5. Catch up to today.** The snapshot is a few days or weeks old. This fetches
 everything posted since, from the arXiv API:
@@ -99,21 +105,18 @@ handing someone `papers.db` and `vectors.f16` does not hand them your profile.
 
 ```json
 {
-  "categories": ["math.AC", "math.AG", "math.CO", "math.NT"],
-  "snapshot": "~/Downloads/arxiv-metadata-oai-snapshot.json"
+  "categories": ["math.AC", "math.AG", "math.CO", "math.NT"]
 }
 ```
 
 | | |
 |---|---|
 | `categories` | the arXiv categories you want, by their full names: `math.AG`, `hep-th`, `cs.LG` ([list](https://arxiv.org/category_taxonomy)). Default: math.AC, math.AG, math.CO |
-| `snapshot` | where the Kaggle snapshot is. Default: the repo root |
 | `embedding` | the Ollama embedding model. Default: `qwen3-embedding:4b`; see [below](#another-embedding-model) |
 
-A relative `snapshot` path is read from the settings file's directory. The profile
-and the automatic-update setting are stored here too, written by the web UI.
-Hand edits are picked up without a restart, except the three keys above, which
-`serve` reads when it starts.
+The profile and the automatic-update setting are stored here too, written by
+the web UI. Hand edits are picked up without a restart, except the two keys
+above, which `serve` reads when it starts.
 
 ### Another embedding model
 
@@ -141,11 +144,11 @@ it is opened.
 
 ### Adding a category
 
-Add it to `categories` and run `build`. That scans the snapshot **for the new
-categories only**, leaving papers already held alone, and the next `update`
-fills in everything since the snapshot was taken. Until then, `status` and the
-web UI list it as not yet in the index. A name that matches no papers in the
-snapshot is reported, since it is most likely a typo.
+Add it to `categories` and run `build` with the snapshot's path. That scans the
+snapshot **for the new categories only**, leaving papers already held alone,
+and the next `update` fills in everything since the snapshot was taken. Until
+then, `status` and the web UI list it as not yet in the index. A name that
+matches no papers in the snapshot is reported, since it is most likely a typo.
 
 ### Removing a category
 
@@ -306,7 +309,7 @@ server running, use cron:
 
 | | |
 |---|---|
-| `build` | backfill from the snapshot, then embed. `--embed-only` skips the scan |
+| `build [SNAPSHOT]` | backfill from the snapshot, then embed. `--scan-only` stops before embedding, `--embed-only` skips the scan |
 | `update` | fetch and embed what is new from the arXiv API |
 | `search` | semantic search; `--author`, `--category`, `--since`, `--rerank`, `--scores`, `--full`, `--json` |
 | `similar` | neighbours of a given arXiv id |
@@ -328,7 +331,7 @@ what was tried and abandoned — is in [NOTES.md](NOTES.md).
 | | |
 |---|---|
 | `config.py` | models, tuning |
-| `settings.py` | the per-person settings file: categories, snapshot, model, profile |
+| `settings.py` | the per-person settings file: categories, model, profile |
 | `store.py` | SQLite schema + append-only vector file |
 | `embedder.py` | Ollama embedding calls with retry |
 | `ingest.py` | snapshot scan + the resumable embedding loop |

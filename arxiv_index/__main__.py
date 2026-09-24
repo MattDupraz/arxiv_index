@@ -4,6 +4,7 @@ import argparse
 import json
 import sys
 import textwrap
+from pathlib import Path
 
 import numpy as np
 
@@ -88,18 +89,33 @@ def ask_categories() -> None:
 def cmd_build(args) -> None:
     db = store.connect()
     store.check_model(db)
+    if args.embed_only and args.snapshot:
+        raise SystemExit("--embed-only does not read the snapshot; "
+                         "give one or the other.")
+    snapshot = args.snapshot.expanduser() if args.snapshot else None
+    if snapshot and not snapshot.is_file():
+        # Before asking for categories, not after.
+        raise SystemExit(f"Snapshot not found at {snapshot}")
     if not args.embed_only:
         ask_categories()
-    if not args.embed_only:
         # Only the categories the index does not hold yet. The rest are kept
         # current by `update`, and the snapshot's copies would be older.
         missing = update_mod.missing(db)
         if missing:
-            ingest.scan_snapshot(db, missing, chunk=20_000)
+            ingest.scan_snapshot(db, missing, path=snapshot, chunk=20_000)
         else:
             print(f"The index already holds "
                   f"{', '.join(settings.categories())}; nothing to scan.")
-    ingest.embed_pending(db)
+    if args.scan_only:
+        pending = store.count_pending(db)
+        if pending:
+            print("\n" + textwrap.fill(
+                f"{pending:,} papers are waiting to be embedded; "
+                "`build --embed-only` does that. Until then they are listed "
+                "by author but not found by searches, and the next `update` "
+                "embeds them too.", 79))
+    else:
+        ingest.embed_pending(db)
     cmd_status(args, db)
 
 
@@ -285,8 +301,15 @@ def main(argv=None) -> None:
     sub = parser.add_subparsers(dest="command", required=True)
 
     p = sub.add_parser("build", help="backfill from the Kaggle snapshot")
-    p.add_argument("--embed-only", action="store_true",
-                   help="skip the snapshot scan; just embed what is pending")
+    p.add_argument("snapshot", nargs="?", type=Path,
+                   help="arxiv-metadata-oai-snapshot.json; default: the "
+                        "one in the repo root")
+    only = p.add_mutually_exclusive_group()
+    only.add_argument("--scan-only", action="store_true",
+                      help="import the papers from the snapshot; embed them "
+                           "later with --embed-only")
+    only.add_argument("--embed-only", action="store_true",
+                      help="skip the snapshot scan; just embed what is pending")
     p.set_defaults(func=cmd_build)
 
     p = sub.add_parser("update", help="fetch and embed new papers from arXiv")

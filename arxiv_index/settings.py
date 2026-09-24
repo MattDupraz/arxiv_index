@@ -14,7 +14,6 @@ hand them your profile.
 
     {
       "categories": ["math.AC", "math.AG", "math.CO"],
-      "snapshot": "~/Downloads/arxiv-metadata-oai-snapshot.json",
       "embedding": {"model": "nomic-embed-text", "dim": 768,
                     "query_prefix": "search_query: ",
                     "document_prefix": "search_document: "},
@@ -24,12 +23,12 @@ hand them your profile.
       "auto_update": {"mode": "daily", "hours": 6, "at": "07:00"}
     }
 
-Every key is optional. Relative paths are read from the file's own directory.
+Every key is optional.
 
 JSON rather than TOML because the web UI writes the profile back, and the
 standard library can read TOML but not write it. The file is re-read on every
-use, so a hand edit is picked up without a restart -- except `categories`,
-`embedding` and `snapshot`, which a running server fixes at start.
+use, so a hand edit is picked up without a restart -- except `categories` and
+`embedding`, which a running server fixes at start.
 
 `embedding` is the odd one out: it describes the index rather than the reader.
 Everyone sharing an index has to name the model it was built with, and
@@ -46,8 +45,6 @@ import os
 import re
 import threading
 from pathlib import Path
-
-ROOT = Path(__file__).resolve().parent.parent
 
 
 def _home() -> Path:
@@ -161,14 +158,6 @@ def categories() -> list:
     return clean_categories(get("categories", list(DEFAULT_CATEGORIES)))
 
 
-def _path_setting(key: str, default: Path) -> Path:
-    raw = get(key)
-    if not raw:
-        return default
-    value = Path(str(raw)).expanduser()
-    return value if value.is_absolute() else (path().parent / value).resolve()
-
-
 def index_dir() -> Path:
     if "index_dir" in load():
         # Refused rather than ignored, or a file written for an earlier
@@ -178,10 +167,6 @@ def index_dir() -> Path:
             "$ARXIV_INDEX_DIR moves the directory holding both this file "
             "and the index.")
     return _home()
-
-
-def snapshot() -> Path:
-    return _path_setting("snapshot", ROOT / "arxiv-metadata-oai-snapshot.json")
 
 
 def embedding(default: dict) -> dict:

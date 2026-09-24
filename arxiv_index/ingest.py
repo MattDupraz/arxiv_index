@@ -12,7 +12,7 @@ import json
 import sys
 import time
 
-from . import config, embedder, settings, store
+from . import config, embedder, store
 
 
 @contextlib.contextmanager
@@ -69,8 +69,8 @@ def scan_snapshot(db, categories, path=None, chunk: int = 20_000) -> int:
     if not path.exists():
         raise SystemExit(
             f"Snapshot not found at {path}\nDownload it from "
-            "https://www.kaggle.com/datasets/Cornell-University/arxiv, or set "
-            f'"snapshot" in {settings.path()} to where it is.')
+            "https://www.kaggle.com/datasets/Cornell-University/arxiv and "
+            "give its path to `build`.")
 
     print(f"Scanning {path.name} for {', '.join(categories)} ...")
     matched = 0

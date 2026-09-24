@@ -32,8 +32,8 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 import numpy as np
 
-from . import (cite, config, profile as profile_mod, rerank as rerank_mod,
-               schedule as schedule_mod, search as search_mod, settings,
+from . import (cite, config, ingest, profile as profile_mod,
+               rerank as rerank_mod, schedule as schedule_mod, search as search_mod, settings,
                store, textnorm, update as update_mod)
 
 # Vendored KaTeX (js, css, woff2 subset). Kept local rather than pulled from a
@@ -532,7 +532,9 @@ class ResidentIndex:
 
 
 class Updater:
-    """Runs `update` in the background, for the UI's "Fetch new papers" button.
+    """Runs `update` in the background, for the UI's "Fetch new papers" button,
+    or just the embedding, for its "Embed them now" (papers imported with
+    `build --scan-only` and not embedded yet).
 
     A top-up walks the arXiv API and then embeds what came back. A week's
     worth is three or four pages and about a minute all told, most of it
@@ -555,6 +557,7 @@ class Updater:
         self._lock = threading.Lock()
         self._thread = None
         self.state = "idle"         # idle | running | done | failed
+        self.kind = "update"        # update | embed
         self.lines = collections.deque(maxlen=self.KEEP_LINES)
         self.started = None
         self.finished = None
@@ -576,12 +579,16 @@ class Updater:
         """
         return self.state == "running" and self._alive()
 
-    def start(self) -> bool:
-        """Kick off a run. False if one is already going."""
+    def start(self, kind: str = "update") -> bool:
+        """Kick off a run. False if one is already going.
+
+        One at a time whatever the kind: both embed, and two embedding runs
+        would only have the second refused by the embed lock.
+        """
         with self._lock:
             if self._in_flight():
                 return False
-            self.state = "running"
+            self.state, self.kind = "running", kind
             self.lines.clear()
             self.started = time.time()
             self.finished = None
@@ -611,8 +618,13 @@ class Updater:
         db = None
         try:
             db = store.connect()
-            embedded = update_mod.update(db, log=self._log,
-                                         progress=self._progress)
+            if self.kind == "embed":
+                store.check_model(db)
+                embedded = ingest.embed_pending(db, log=self._log,
+                                                progress=self._progress)
+            else:
+                embedded = update_mod.update(db, log=self._log,
+                                             progress=self._progress)
         except (Exception, SystemExit) as exc:  # noqa: BLE001
             # SystemExit deliberately included: the embed lock, the model check
             # and the Ollama probe all raise it to end a CLI run, and none of
@@ -621,7 +633,7 @@ class Updater:
             with self._lock:
                 self.state, self.error = "failed", message
                 self.finished, self.progress = time.time(), None
-            self._log(f"update failed: {message}")
+            self._log(f"{self.kind} failed: {message}")
         else:
             with self._lock:
                 self.state, self.embedded = "done", embedded
@@ -641,6 +653,7 @@ class Updater:
                 self.error = self.error or "the update thread stopped"
             payload = {
                 "state": state,
+                "kind": self.kind,
                 "lines": list(self.lines),
                 "embedded": self.embedded,
                 "error": self.error,
@@ -897,6 +910,17 @@ def make_handler(index: ResidentIndex, updater: Updater,
                     # A manual run resets the clock too, so the scheduler does
                     # not follow it with one of its own minutes later.
                     index.note_run(time.time())
+                    self._json(updater.snapshot())
+                    return
+
+                if path == "/api/embed":
+                    # Progress is read from GET /api/update, as for a fetch.
+                    # Not a fetch, so the schedule's clock is left alone.
+                    if not updater.start("embed"):
+                        self._json(updater.snapshot() |
+                                   {"error": "An update is already running."},
+                                   409)
+                        return
                     self._json(updater.snapshot())
                     return
                 self._send(b"not found", "text/plain", 404)
@@ -1436,6 +1460,7 @@ button.cog[aria-expanded="true"] {
    never between them. */
 .dates { display: flex; gap: 10px; align-items: center; }
 #status { padding: 14px 0 0; font-size: 14px; color: var(--muted); min-height: 20px; }
+#embed { margin-left: 8px; }
 #results { padding: 6px 0 60px; }
 article {
   background: var(--panel); border: 1px solid var(--line); border-radius: 9px;
@@ -1592,7 +1617,9 @@ counts in full, which favours papers near the middle of all of them.">
 </div></header>
 
 <div class="wrap">
-  <div id="status"></div>
+  <div id="status"><span id="status-text"></span>
+    <button type="button" id="embed" class="ghost" hidden
+            title="Embed the papers that are in the index but not yet searchable">Embed them now</button></div>
   <div id="results"></div>
 </div>
 
@@ -1708,6 +1735,9 @@ const esc = s => (s||"").replace(/[&<>"]/g, c =>
 const tidy = s => (s||"").replace(/\s+/g, " ").trim();
 
 let stats = null, lastNote = null;
+// Whether a fetch or an embedding run is going, and whether it embeds; set by
+// updateState() below, read by note() to word the pending count.
+let running = false, embedding = false;
 
 function refreshStats() {
   return fetch("/api/stats").then(r => r.json()).then(s => {
@@ -1729,11 +1759,14 @@ function note(extra) {
       bits.push(stats.missing.join(", ") + " not in the index yet — "
                 + "run build to add");
     if (stats.pending > 0)
-      bits.push(stats.pending.toLocaleString() + " still embedding — "
-                + "results improve as the build finishes");
+      bits.push(stats.pending.toLocaleString() + (embedding
+        ? " still embedding — results improve as it goes"
+        : " not embedded yet, so not searchable"));
   }
   if (lastNote) bits.unshift(lastNote);
-  $("#status").textContent = bits.join("  ·  ");
+  $("#status-text").textContent = bits.join("  ·  ");
+  // Offered only when nothing is running: a fetch embeds what is pending too.
+  $("#embed").hidden = !(stats && stats.pending > 0) || running;
 }
 
 /* Reranked hits carry two scores on different scales, shown stacked so they can
@@ -2174,8 +2207,8 @@ async function copyCite(card) {
    reloaded mid-run picks the run back up instead of offering to start a
    second one. */
 
-const fetchBtn = $("#fetch"), updBox = $("#update");
-let updTimer = null;
+const fetchBtn = $("#fetch"), embedBtn = $("#embed"), updBox = $("#update");
+let updTimer = null, statsTimer = null;
 // Whether this page has seen the current run go by. A finished run stays on
 // the server until the next one, and a reload an hour later should not
 // announce it as though it had just happened.
@@ -2188,9 +2221,12 @@ function showUpdate(text, bad) {
 }
 
 function updateState(s) {
-  const running = s.state === "running";
+  running = s.state === "running";
+  embedding = running && (s.kind === "embed" || !!s.progress);
   fetchBtn.disabled = running;
-  fetchBtn.textContent = running ? "Fetching…" : "Fetch new papers";
+  fetchBtn.textContent = running && s.kind !== "embed"
+    ? "Fetching…" : "Fetch new papers";
+  note();
   if (running) watched = true;
 
   if (running) {
@@ -2203,9 +2239,12 @@ function updateState(s) {
   } else if (!watched) {
     updBox.hidden = true;
   } else if (s.state === "failed") {
-    showUpdate("Update failed: " + (s.error || "unknown error"), true);
+    showUpdate((s.kind === "embed" ? "Embedding" : "Update")
+               + " failed: " + (s.error || "unknown error"), true);
   } else if (s.state === "done") {
-    showUpdate((s.embedded
+    showUpdate((s.kind === "embed"
+      ? `Embedded ${s.embedded.toLocaleString()} paper(s)`
+      : s.embedded
       ? `Fetched and embedded ${s.embedded.toLocaleString()} paper(s)`
       : "Already up to date") + ` · ${s.elapsed}s`);
   } else {
@@ -2214,9 +2253,13 @@ function updateState(s) {
 
   if (running && !updTimer) {
     updTimer = setInterval(pollUpdate, 1500);
+    // A long embedding run makes papers searchable as it goes; keep the
+    // header's count moving with it rather than frozen at the start.
+    statsTimer = setInterval(refreshStats, 30000);
   } else if (!running && updTimer) {
     clearInterval(updTimer);
-    updTimer = null;
+    clearInterval(statsTimer);
+    updTimer = statsTimer = null;
     // The header counts were read once at load; a finished run has moved them.
     refreshStats();
     // And a run that just finished is the one the next one is timed from.
@@ -2241,6 +2284,18 @@ fetchBtn.onclick = async () => {
   } catch (e) {
     showUpdate("Could not start the update: " + e.message, true);
     fetchBtn.disabled = false;
+  }
+};
+
+embedBtn.onclick = async () => {
+  embedBtn.hidden = true;
+  watched = true;
+  showUpdate("Starting…");
+  try {
+    updateState(await (await fetch("/api/embed", {method: "POST"})).json());
+  } catch (e) {
+    showUpdate("Could not start embedding: " + e.message, true);
+    embedBtn.hidden = false;
   }
 };
 
