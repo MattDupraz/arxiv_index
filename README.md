@@ -16,9 +16,21 @@ build the index, which takes one large download and a few hours of embedding.
 After that, keeping it current takes about a minute a week.
 
 **1. Install Ollama and the embedding model.** Ollama runs the model that
-turns text into vectors. Install it from [ollama.com](https://ollama.com), make
-sure it is running (`ollama serve`, or the service its installer sets up), and
-fetch the model, about 2.5 GB:
+turns text into vectors, as a server of its own that this program talks to, so
+it has to be **running** whenever you use it. Install it from
+[ollama.com](https://ollama.com). Then:
+
+- **Linux:** the install script sets it up as a service that starts with the
+  machine. `systemctl status ollama` shows whether it is running, and
+  `sudo systemctl start ollama` starts it.
+- **macOS and Windows:** the Ollama app runs it in the background; start the
+  app, and it stays in the menu bar or system tray.
+- **Anywhere else**, or without the service: run `ollama serve` in a terminal
+  of its own, and leave it open.
+
+`ollama list` checks it: it lists the installed models when Ollama is running,
+and fails with an error that it could not connect when it is not. Then fetch
+the model, about 2.5 GB:
 
 ```bash
 ollama pull qwen3-embedding:4b
@@ -275,6 +287,13 @@ arxiv_index build --embed-only
 The reverse does not work: `vectors.f16` alone is anonymous numbers.
 
 ## Using it
+
+Ollama has to be running (see [First-time setup](#first-time-setup)) whenever
+something is embedded: a search with a query, **Fetch new papers** and
+automatic updates, and saving new research interests. Without it, listing by
+author or date, **Followed authors**, **Similar papers** and **BibLaTeX** still
+work; a search fails, after a few seconds of retrying, with an error that the
+embedding failed.
 
 The web UI has a search box, an author filter, category checkboxes, a date
 range, expandable abstracts, a **BibLaTeX** button and **Similar papers** on
