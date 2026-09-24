@@ -67,7 +67,7 @@ BATCH_SIZE = 64
 # The index is ~/.arxiv_index or $ARXIV_INDEX_DIR. The snapshot is whatever
 # `build` is given, else this one in the current directory.
 SNAPSHOT = Path("arxiv-metadata-oai-snapshot.json")
-INDEX_DIR = settings.index_dir()
+INDEX_DIR = settings.home()
 DB_PATH = INDEX_DIR / "papers.db"
 VEC_PATH = INDEX_DIR / "vectors.f16"
 

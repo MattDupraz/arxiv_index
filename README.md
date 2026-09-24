@@ -24,8 +24,9 @@ fetch the model, about 2.5 GB:
 ollama pull qwen3-embedding:4b
 ```
 
-To use a different model, see [Another embedding model](#another-embedding-model)
-**before** building: an index cannot change model afterwards.
+To use a different model, pull it too and choose it on the setup page, or see
+[Another embedding model](#another-embedding-model), **before** building: an
+index cannot change model afterwards.
 
 **2. Install it.** Python 3.11 or newer:
 
@@ -43,10 +44,12 @@ repository, `python3 -m arxiv_index` runs it without installing at all.
 
 **The rest can be done in the browser.** Run `arxiv_index serve`
 now: with the index still empty, the page it opens is a first-time setup. It
-asks for your categories, then fills the index from the arXiv snapshot (step 3
-says where to get it) or from an index exported by another instance, taking up
-that instance's settings too if it was exported with them, and shows the
-progress. The steps below do the same in a terminal.
+asks for your categories and for the embedding model, from those installed in
+Ollama, then fills the index from the arXiv snapshot (step 3 says where to get
+it) and shows the progress. Or it installs an index exported by another
+instance, which brings its own model and categories, and its followed authors
+and interests too if it was exported with its settings. The steps below do the
+same in a terminal.
 
 If you have an index exported from another machine, skip steps 3 and 4:
 `arxiv_index import arxiv_index.tar` installs it (see
@@ -128,6 +131,9 @@ above, which `serve` reads when it starts.
 
 ### Another embedding model
 
+The setup page offers every embedding model installed in Ollama and fills this
+in for you. By hand:
+
 ```json
 "embedding": {
   "model": "nomic-embed-text",
@@ -146,9 +152,6 @@ An index is tied to the model that built it. `model`, `dim` and
 vectors would not be comparable. To switch models, point `$ARXIV_INDEX_DIR` at
 a new directory and `build` there. `query_prefix` is free to change at any
 time.
-
-An index from before this file existed moves its profile here the first time
-it is opened.
 
 ### Adding a category
 
@@ -183,8 +186,11 @@ in place of the settings there, which are kept as `config.json.bak`; without
 it they are left out. Settings naming a different embedding model from the
 index's are refused.
 
-Importing refuses an index built with a different embedding model from the one
-your settings name. Where there is an index already, it needs one of:
+Into an empty index, a fresh install, the export brings its embedding model
+and the categories it holds, and your settings are updated to match; if that
+model is not installed in Ollama, the import says to pull it. Into an index
+that has papers, an export built with a different embedding model from the one
+your settings name is refused, and it needs one of:
 
 | | |
 |---|---|
@@ -338,7 +344,7 @@ as `serve` is up, so an index does not go stale behind a server left running:
 | | |
 |---|---|
 | **Off** | the default |
-| **Every N hours** | measured from the end of the last run, 1 to 168 |
+| **Every N hours** | measured from when the last run started, 1 to 168 |
 | **Daily at HH:MM** | a wall-clock time, in the server machine's **local** time |
 
 Local rather than UTC on purpose: 07:00 means 07:00 where you are, and arXiv's

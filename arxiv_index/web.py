@@ -26,6 +26,7 @@ import mimetypes
 import os
 import pathlib
 import signal
+import sys
 import threading
 import time
 import webbrowser
@@ -34,7 +35,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 import numpy as np
 
-from . import (cite, config, ingest, profile as profile_mod,
+from . import (cite, config, embedder, ingest, profile as profile_mod,
                schedule as schedule_mod, search as search_mod, settings,
                store, textnorm, transfer, update as update_mod)
 
@@ -55,15 +56,13 @@ class ResidentIndex:
         store.check_model(self.db)
         self._db_file = os.stat(config.DB_PATH).st_ino
         self._vec_file = self._vector_file()
-        # Fixed for the life of the server: the category masks below are built
-        # from this list, so a checkbox for a category added to the settings
-        # since would filter on a mask that does not exist.
+        # Read once rather than per request: the category masks are built from
+        # this list, so a category added to the settings file since would
+        # filter on a mask that does not exist. set_categories changes it.
         self.categories = settings.categories()
         self._read_holdings()
         self.ids = []
         self.matrix = None
-        self.loaded = 0
-        self.meta_loaded = -1
         self.gpu = None          # matrix in VRAM, when available
         self.torch = None
         # Values that repeat across rows, held once. See _shared().
@@ -169,7 +168,6 @@ class ResidentIndex:
         self.authors = authors
         self.cat_masks = {cat: np.array(mask, dtype=bool)
                           for cat, mask in masks.items()}
-        self.loaded = len(ids)
         self._to_gpu()
 
     def reload_metadata(self) -> None:
@@ -200,7 +198,6 @@ class ResidentIndex:
         self.meta_dates = dates
         self.meta_cats = cats
         self.meta_authors = authors
-        self.meta_loaded = len(ids)
 
     def set_categories(self, categories) -> None:
         """Switch to other categories: on setting up, or on taking up an
@@ -215,8 +212,8 @@ class ResidentIndex:
         held = update_mod.cursors(self.db)
         self.missing = [c for c in self.categories if c not in held]
         # With nothing ticked a search covers the reader's categories -- which
-        # on an index holding only those is everything, and needs no mask. A
-        # shared index may hold others', and those should not appear here.
+        # on an index holding only those is everything, and needs no mask. An
+        # index may hold others too, and those should not appear here.
         self.default_categories = (
             self.categories if set(held) - set(self.categories) else None)
 
@@ -347,16 +344,14 @@ class ResidentIndex:
     def query(self, text, k=20, categories=None, since=None, exclude=None,
               author=None, until=None):
         self.refresh_if_stale()
-        if not self.ids:
-            return [], 0.0
-
         started = time.monotonic()
-
         if not text:
             # No query to be similar to, so this is a metadata listing and has
-            # no business consulting the vectors at all.
+            # no business consulting the vectors -- which may not exist yet.
             return (self.browse(k, categories, since, author, until),
                     time.monotonic() - started)
+        if not self.ids:
+            return [], 0.0
 
         keep = self._mask(categories, since, until, author)
 
@@ -366,23 +361,18 @@ class ResidentIndex:
         if keep is not None:
             if not keep.any():
                 return [], time.monotonic() - started
-            # Push filtered-out rows below any real cosine rather than
+            # Push filtered-out rows below any real score rather than
             # compacting the array, which would cost a copy.
-            scores = np.where(keep, scores, -2.0)
+            scores = np.where(keep, scores, -np.inf)
+        return self._pick(scores, k, exclude), time.monotonic() - started
 
-        want = min(k + (1 if exclude else 0), len(self.ids))
-        top = np.argpartition(-scores, want - 1)[:want]
-        top = top[np.argsort(-scores[top])]
-
-        chosen = [self.ids[i] for i in top
-                  if scores[i] > -2.0 and self.ids[i] != exclude][:k]
-        if not chosen:
-            return [], time.monotonic() - started
-
-        by_id = {self.ids[i]: float(scores[i]) for i in top}
-        meta = self._meta(chosen)
-        return ([meta[i] | {"score": by_id[i]} for i in chosen],
-                time.monotonic() - started)
+    def _pick(self, scores, k, exclude=None) -> list:
+        """The k best-scoring papers, best first, as dicts with their scores.
+        Rows scored -inf are filtered out; `exclude` is an id to leave out."""
+        best = [i for i in search_mod.top(scores, k + (1 if exclude else 0))
+                if np.isfinite(scores[i]) and self.ids[i] != exclude][:k]
+        found = self._meta([self.ids[i] for i in best])
+        return [found[self.ids[i]] | {"score": float(scores[i])} for i in best]
 
     def _matching_rows(self, categories=None, since=None, until=None,
                        match_author=None):
@@ -510,21 +500,10 @@ class ResidentIndex:
         per.sort(axis=1)
         scores = per[:, ::-1] @ profile_mod.blend_decay(blend, per.shape[1])
 
-        # -inf rather than a sentinel below every real score: weights scale
-        # these past [-1, 1], so no finite floor is safe to assume any more.
+        # -inf, since weights scale these past [-1, 1].
         if keep is not None:
             scores = np.where(keep, scores, -np.inf)
-
-        want = min(max(k, 1), len(self.ids))
-        top = np.argpartition(-scores, want - 1)[:want]
-        top = top[np.argsort(-scores[top])]
-        chosen = [self.ids[i] for i in top if np.isfinite(scores[i])]
-        if not chosen:
-            return [], time.monotonic() - started
-        by_id = {self.ids[i]: float(scores[i]) for i in top}
-        meta = self._meta(chosen)
-        return ([meta[i] | {"score": by_id[i]} for i in chosen],
-                time.monotonic() - started)
+        return self._pick(scores, max(k, 1)), time.monotonic() - started
 
     # --- When the index was last topped up ---------------------------------
     # The profile and the schedule setting live in the settings file and need
@@ -543,43 +522,18 @@ class ResidentIndex:
         return self.meta_dates[0] if self.meta_dates else ""
 
     def _meta(self, ids) -> dict:
-        placeholders = ",".join("?" * len(ids))
-        return {
-            r["id"]: dict(r)
-            for r in self._rows(
-                f"SELECT * FROM papers WHERE id IN ({placeholders})", ids
-            )
-        }
-
-    def vector_for(self, paper_id):
-        found = self._rows("SELECT row FROM papers WHERE id = ?", (paper_id,))
-        row = found[0] if found else None
-        if row is None or row["row"] is None:
-            return None
-        total = store.vector_count()
-        mm = np.memmap(config.VEC_PATH, dtype=config.VEC_DTYPE, mode="r",
-                       shape=(total, config.DIM))
-        return np.asarray(mm[row["row"]], dtype=np.float32)
+        with self._db_lock:
+            return search_mod.papers(self.db, ids)
 
     def similar(self, paper_id, k=20):
-        """Papers closest to a given one."""
+        """Papers closest to a given one; (None, 0) if it has no vector."""
         self.refresh_if_stale()
-        vector = self.vector_for(paper_id)
-        if vector is None:
+        found = self._rows("SELECT row FROM papers WHERE id = ?", (paper_id,))
+        if not found or found[0]["row"] is None:
             return None, 0.0
         started = time.monotonic()
-        scores = self.score(vector)
-        # +1 because the paper matches itself.
-        want = min(k + 1, len(self.ids))
-        top = np.argpartition(-scores, want - 1)[:want]
-        top = top[np.argsort(-scores[top])]
-        chosen = [self.ids[i] for i in top if self.ids[i] != paper_id][:k]
-        if not chosen:
-            return [], time.monotonic() - started
-        by_id = {self.ids[i]: float(scores[i]) for i in top}
-        meta = self._meta(chosen)
-        return ([meta[i] | {"score": by_id[i]} for i in chosen],
-                time.monotonic() - started)
+        scores = self.score(store.read_vector(found[0]["row"]))
+        return self._pick(scores, k, paper_id), time.monotonic() - started
 
 
 class Updater:
@@ -617,6 +571,7 @@ class Updater:
         self.kind = "update"        # update | embed | snapshot | index
         self.upload = None          # an import's _Upload
         self.imported = 0           # papers in scope, once a snapshot is read
+        self.restarting = None      # the model an import restarts the server with
         self.matched = 0            # the same, so far, while it is read
         self.lines = collections.deque(maxlen=self.KEEP_LINES)
         self.started = None
@@ -656,6 +611,7 @@ class Updater:
             self._categories = list(categories)
             self._take_settings = take_settings
             self.imported = self.matched = 0
+            self.restarting = None
             self.lines.clear()
             self.started = time.time()
             self.finished = None
@@ -732,11 +688,21 @@ class Updater:
         return ingest.embed_pending(db, log=self._log, progress=self._progress)
 
     def _import_index(self) -> int:
-        took = transfer.import_stream(
+        """Import the uploaded export. Into an empty index it brings its own
+        model and categories (see transfer.import_stream); a model other than
+        the one this server runs with needs a restart to take up."""
+        result = transfer.import_stream(
             self.upload, self.upload.name, replace=self._mode == "replace",
             merge=self._mode == "merge", take_settings=self._take_settings,
             log=self._log, on_read=self.upload.finished)
-        if took and self._index is not None:
+        if result["model_changed"]:
+            with self._lock:
+                self.restarting = result["model"]
+            # Long enough for a page polling once a second to see the run
+            # finish, and so know to wait for the server to come back.
+            threading.Thread(target=_restart, args=(result["model"], 3.0),
+                             daemon=True).start()
+        elif self._index is not None:
             # The categories are the one setting the server fixes at start;
             # the rest are read afresh wherever they are used.
             self._index.set_categories(settings.categories())
@@ -761,6 +727,7 @@ class Updater:
                 "lines": list(self.lines),
                 "embedded": self.embedded,
                 "imported": self.imported,
+                "restarting": self.restarting,
                 "error": self.error,
             }
             if self.started:
@@ -846,8 +813,8 @@ class Scheduler:
     refusal to start a second run on top of a first.
 
     Each tick re-reads the setting, so changing it in the UI takes effect
-    within the tick rather than at the next restart. The read is one `meta`
-    row, which is why polling is affordable enough to keep the alternative --
+    within the tick rather than at the next restart. The read is a small file,
+    which is why polling is affordable enough to keep the alternative --
     waking exactly at the due moment, and rearming whenever the setting
     changes -- from being worth its extra machinery.
 
@@ -1022,6 +989,44 @@ def make_handler(index: ResidentIndex, updater: Updater,
             upload.done.wait()
             self._json(updater.snapshot())
 
+        def _choose_model(self, model) -> None:
+            """Set the embedding model of an index with no papers yet.
+
+            The model is read once, when the server starts, and its dimension
+            and the index's record of it follow from it; so rather than patch
+            all of that in place, the server records the choice and restarts
+            itself, which with the index empty costs nothing.
+            """
+            if not self._trusted():
+                self._json({"error": "Setting up is only offered on the "
+                                     "machine running the server."}, 403)
+                return
+            if model == config.MODEL:
+                self._json({"model": model, "restarting": False})
+                return
+            if index.stats()["papers"]:
+                self._json({"error": "The index already has papers, so its "
+                                     "embedding model cannot change."}, 409)
+                return
+            try:
+                chosen = next((m for m in embedder.embedding_models()
+                               if m["name"] == model), None)
+            except SystemExit as exc:
+                self._json({"error": str(exc)}, 502)
+                return
+            if chosen is None:
+                self._json({"error": f"{model} is not an installed embedding "
+                                     "model."}, 400)
+                return
+            # The default's prompts are known; another model gets none.
+            settings.update(embedding=(
+                {"model": model} if model == config.DEFAULT_EMBEDDING["model"]
+                else {"model": model, "dim": chosen["dim"]}))
+            with index._db_lock:
+                store.forget_embedding(index.db)
+            self._json({"model": model, "restarting": True})
+            threading.Thread(target=_restart, args=(model,), daemon=True).start()
+
         def _export(self) -> None:
             """Stream the index out as an export, the same file `export` writes."""
             if not self._trusted():
@@ -1152,6 +1157,10 @@ def make_handler(index: ResidentIndex, updater: Updater,
                     self._json({"categories": chosen})
                     return
 
+                if path == "/api/setup/model":
+                    self._choose_model((body or {}).get("model"))
+                    return
+
                 if path == "/api/profile":
                     if body is None:
                         self._json({"error": "expected a JSON body"}, 400)
@@ -1246,13 +1255,7 @@ def make_handler(index: ResidentIndex, updater: Updater,
             if since and until and since > until:
                 self._json({"error": f"{since} is after {until}"}, 400)
                 return None
-            try:
-                # Generous, because listing a prolific author's whole output
-                # is a legitimate request (Sturmfels has 217).
-                k = max(1, min(500, int(one("k", "20"))))
-            except ValueError:
-                k = 20
-            return cats, since, until, k
+            return cats, since, until, _count(one)
 
         def _route(self):
             parsed = urlparse(self.path)
@@ -1273,7 +1276,13 @@ def make_handler(index: ResidentIndex, updater: Updater,
                 return
 
             if parsed.path == "/api/setup":
+                try:
+                    models, problem = embedder.embedding_models(), None
+                except SystemExit as exc:
+                    models, problem = [], str(exc)
                 self._json({"categories": index.categories,
+                            "model": config.MODEL, "models": models,
+                            "ollama_error": problem,
                             "local": self._local(),
                             "papers": index.stats()["papers"]})
                 return
@@ -1313,7 +1322,7 @@ def make_handler(index: ResidentIndex, updater: Updater,
                 authors = profile_mod.load()["authors"]
                 if not authors:
                     self._json({"error": "No followed authors yet. Add some "
-                                         "under Profile."}, 400)
+                                         "under ⚙."}, 400)
                     return
                 started = time.monotonic()
                 # Everything in the window, not the page's result count: the
@@ -1343,7 +1352,7 @@ def make_handler(index: ResidentIndex, updater: Updater,
                 profile = profile_mod.load()
                 if not profile["interests"]:
                     self._json({"error": "No research interests yet. Describe "
-                                         "them under Profile."}, 400)
+                                         "them under ⚙."}, 400)
                     return
                 queries, weights = profile_mod.vectors()
                 if queries is None:
@@ -1434,13 +1443,7 @@ def make_handler(index: ResidentIndex, updater: Updater,
 
             if parsed.path == "/api/similar":
                 paper_id = one("id", "")
-                try:
-                    # Generous, because listing a prolific author's whole
-                    # output is a legitimate request (Sturmfels has 217).
-                    k = max(1, min(500, int(one("k", "20"))))
-                except ValueError:
-                    k = 20
-                results, elapsed = index.similar(paper_id, k)
+                results, elapsed = index.similar(paper_id, _count(one))
                 if results is None:
                     self._json({"error": f"{paper_id} has no vector yet"}, 404)
                     return
@@ -1461,12 +1464,32 @@ def _scope(since, until) -> str:
     return "in this range" if (since or until) else "anywhere in the index"
 
 
+def _count(one) -> int:
+    """The `k` a request asks for. Generous, because listing a prolific
+    author's whole output is a legitimate request (Sturmfels has 217)."""
+    try:
+        return max(1, min(500, int(one("k", "20"))))
+    except ValueError:
+        return 20
+
+
 def _valid_date(text: str) -> bool:
     try:
         dt.datetime.strptime(text, "%Y-%m-%d")
         return True
     except ValueError:
         return False
+
+
+def _restart(model: str, delay: float = 0.5) -> None:
+    """Start this server again as the same command, once the answer that
+    announced it has gone out. The page waits for it to come back."""
+    time.sleep(delay)
+    print(f"\nRestarting with the embedding model {model} ...", flush=True)
+    argv = [sys.executable] + sys.orig_argv[1:]
+    if "--no-browser" not in argv:
+        argv.append("--no-browser")     # the page is already open
+    os.execv(sys.executable, argv)
 
 
 WATCH_INTERVAL = 5.0    # seconds between looks at the index for changes
@@ -2784,7 +2807,13 @@ input[type=text] {
   border: 1px solid var(--line); border-radius: 7px; background: var(--bg);
   color: var(--ink);
 }
-input[type=text]:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+input[type=text]:focus, select:focus { outline: 2px solid var(--accent);
+                                       outline-offset: -1px; }
+select {
+  width: 100%; padding: 9px 11px; font: inherit; font-size: 15px;
+  border: 1px solid var(--line); border-radius: 7px; background: var(--bg);
+  color: var(--ink);
+}
 .choices { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
 @media (max-width: 640px) { .choices { grid-template-columns: 1fr; } }
 .choice {
@@ -2817,8 +2846,8 @@ button:disabled { opacity: .45; cursor: default; }
 <div class="wrap">
   <h1>arXiv index <span>· first-time setup</span></h1>
   <p class="lead">The index is empty. Choose the arXiv categories it should
-    cover, then fill it: from arXiv's own metadata, or from an index exported
-    by another instance.</p>
+    cover and the model that embeds them, then fill it: from arXiv's own
+    metadata, or from an index exported by another instance.</p>
 
   <section class="step" id="remote" hidden>
     <h2>Open this page on the machine running the server</h2>
@@ -2839,8 +2868,19 @@ button:disabled { opacity: .45; cursor: default; }
     <div class="err" id="cats-err"></div>
   </section>
 
+  <section class="step" id="s-model">
+    <h2>2. Embedding model</h2>
+    <p class="lead">The model that turns abstracts and searches into vectors,
+      from the ones installed in Ollama. The default,
+      <code>qwen3-embedding:4b</code>, is the one this was tuned with. To use
+      another, <code>ollama pull</code> it and reload this page. An index keeps
+      its model for good.</p>
+    <select id="model" aria-label="Embedding model"></select>
+    <div class="err" id="model-err"></div>
+  </section>
+
   <section class="step" id="s2">
-    <h2>2. Fill the index</h2>
+    <h2>3. Fill the index</h2>
     <div class="choices">
       <div class="choice">
         <b>From arXiv's snapshot</b>
@@ -2873,10 +2913,9 @@ button:disabled { opacity: .45; cursor: default; }
         <label class="check"><input type="checkbox" id="take" checked>
           Use its settings too, if it has them</label>
         <span class="hint">The embeddings come with it, so it is searchable at
-          once. It must have been built with the embedding model your settings
-          name, by default <code>qwen3-embedding:4b</code>. Its settings, if it
-          was exported with them, bring its categories, followed authors and
-          interests in place of the categories above.</span>
+          once. Its embedding model and categories come with it too, in place
+          of the choices above; so do its followed authors and interests, if
+          it was exported with its settings.</span>
         <span class="grow"></span>
         <button type="button" id="tar-go" disabled>Import</button>
       </div>
@@ -2900,12 +2939,14 @@ const bytes = n => n >= 1e9 ? (n / 1e9).toFixed(2) + " GB"
                             : Math.round(n / 1e6).toLocaleString() + " MB";
 const count = n => n.toLocaleString();
 let busy = false, uploading = false, timer = null;
+let current = null;     // the model the server is running with
 
 function refresh() {
-  for (const el of ["#cats", "#snap", "#tar", "#embed", "#take"])
+  const noModel = !$("#model").value;
+  for (const el of ["#cats", "#model", "#snap", "#tar", "#embed", "#take"])
     $(el).disabled = busy;
-  $("#snap-go").disabled = busy || !$("#snap").files.length;
-  $("#tar-go").disabled = busy || !$("#tar").files.length;
+  $("#snap-go").disabled = busy || noModel || !$("#snap").files.length;
+  $("#tar-go").disabled = busy || noModel || !$("#tar").files.length;
 }
 $("#snap").onchange = $("#tar").onchange = refresh;
 
@@ -2914,9 +2955,21 @@ async function init() {
   $("#cats").value = s.categories.join(" ");
   if (!s.local) {
     $("#remote").hidden = false;
-    $("#s1").hidden = $("#s2").hidden = true;
+    $("#s1").hidden = $("#s-model").hidden = $("#s2").hidden = true;
     return;
   }
+  current = s.model;
+  for (const m of s.models) {
+    const o = new Option(`${m.name}  (${m.dim.toLocaleString()} dimensions)`,
+                         m.name, false, m.name === s.model);
+    $("#model").append(o);
+  }
+  if (!s.models.length)
+    $("#model-err").textContent = s.ollama_error || "No embedding model is "
+      + "installed. Run: ollama pull qwen3-embedding:4b, then reload this page.";
+  else if (!s.models.some(m => m.name === s.model))
+    $("#model").value = s.models[0].name;
+  refresh();
   // A reload in the middle of an import picks the run up, not a second one.
   const u = await (await fetch("/api/update")).json();
   if (u.state === "running" && (u.kind === "snapshot" || u.kind === "index"))
@@ -2965,6 +3018,24 @@ async function poll() {
   catch (e) { /* transient; the next tick asks again */ }
 }
 
+/* An export with another model restarts the server once it is in; the page
+   says so, and shows the result when the server answers with that model. */
+async function awaitRestart(model) {
+  $("#p-title").textContent = "Switching model";
+  $("#p-text").textContent = `The export uses ${model}; restarting the server `
+    + "with it…";
+  for (let i = 0; i < 120; i++) {
+    await new Promise(done => setTimeout(done, 500));
+    try {
+      const now = await (await fetch("/api/setup")).json();
+      if (now.model === model) return true;
+    } catch (e) { /* still restarting */ }
+  }
+  $("#p-err").textContent = "The server did not come back; check the "
+    + "terminal running it.";
+  return false;
+}
+
 function render(s) {
   // Until the upload's request has been taken up, an idle answer is stale.
   if (uploading && s.state !== "running") return;
@@ -2995,7 +3066,24 @@ function render(s) {
     $("#p-err").textContent = s.error || "unknown error";
     return;
   }
+  if (s.state === "idle") {
+    // A server restarted since, which remembers no run: the index says
+    // whether the import went in.
+    fetch("/api/setup").then(r => r.json()).then(now => {
+      if (!now.papers) return;
+      setBar(1);
+      $("#p-title").textContent = "Done";
+      $("#p-text").textContent = `The index is in place, with ${now.model}.`;
+      $("#p-done").hidden = false;
+    });
+    return;
+  }
   if (s.state !== "done") return;
+  if (s.restarting) {
+    const settled = {...s, restarting: null};
+    awaitRestart(s.restarting).then(ok => { if (ok) render(settled); });
+    return;
+  }
   setBar(1);
   if (s.kind === "snapshot" && !s.imported) {
     $("#p-title").textContent = "Nothing imported";
@@ -3012,17 +3100,49 @@ function render(s) {
       + "The snapshot is a few days or weeks old; Fetch new papers, under ⚙, "
       + "brings the index up to date.";
   } else {
-    $("#p-text").textContent = "The export is installed."
+    const uses = s.lines.find(l => l.startsWith("This index now uses")) || "";
+    $("#p-text").textContent = "The export is installed. " + uses
       + (s.lines.some(l => l.startsWith("Took up"))
-         ? " So are its settings." : "");
+         ? " Its settings are in place too." : "");
+    const pull = s.lines.find(l => l.includes("ollama pull"));
+    if (pull) $("#p-err").textContent = pull;
     $("#p-next").textContent = "Fetch new papers, under ⚙, brings it up to "
       + "date with whatever was posted since it was exported.";
   }
   $("#p-done").hidden = false;
 }
 
+/* A different model restarts the server with it (see _choose_model), so
+   wait for it to come back before sending anything. */
+async function ensureModel() {
+  const want = $("#model").value;
+  $("#model-err").textContent = "";
+  if (want === current) return true;
+  const r = await fetch("/api/setup/model", {
+    method: "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({model: want})});
+  const s = await r.json();
+  if (!r.ok) { $("#model-err").textContent = s.error; return false; }
+  $("#s3").hidden = false;
+  $("#p-title").textContent = "Switching model";
+  $("#p-text").textContent = `Restarting the server with ${want}…`;
+  for (let i = 0; i < 120; i++) {
+    await new Promise(done => setTimeout(done, 500));
+    try {
+      const now = await (await fetch("/api/setup")).json();
+      if (now.model === want) { current = want; return true; }
+    } catch (e) { /* still restarting */ }
+  }
+  $("#model-err").textContent = "The server did not come back; check the "
+    + "terminal running it.";
+  return false;
+}
+
 async function upload(kind, file, params) {
-  if (!(await saveCategories())) return;
+  // An export brings its own model and categories; only the snapshot needs
+  // the choices above.
+  if (kind === "snapshot"
+      && (!(await saveCategories()) || !(await ensureModel()))) return;
   uploading = true;
   watch(kind);
   setBar(0);

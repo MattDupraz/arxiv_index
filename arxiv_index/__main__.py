@@ -93,7 +93,7 @@ def cmd_build(args) -> None:
         # current by `update`, and the snapshot's copies would be older.
         missing = update_mod.missing(db)
         if missing:
-            ingest.scan_snapshot(db, missing, path=snapshot, chunk=20_000)
+            ingest.scan_snapshot(db, missing, path=snapshot)
         else:
             print(f"The index already holds "
                   f"{', '.join(settings.categories())}; nothing to scan.")
@@ -124,9 +124,9 @@ def cmd_search(args) -> None:
     categories = args.category
     if not categories and set(update_mod.cursors(db)) - set(
             settings.categories()):
-        # A shared index holding others' categories: keep to your own. On an
-        # index holding only yours this would be a no-op filter that costs a
-        # copy of the matrix, so it is skipped.
+        # An index holding categories you do not: keep to your own. On one
+        # holding only yours this would be a no-op filter that costs a copy of
+        # the matrix, so it is skipped.
         categories = settings.categories()
     results = search_mod.search(
         db, args.query, k=args.k, categories=categories, since=args.since,
@@ -150,29 +150,13 @@ def cmd_similar(args) -> None:
     if row["row"] is None:
         raise SystemExit(f"{args.id} has no vector yet; run `build` or `update`.")
 
-    total = store.vector_count()
-    mm = np.memmap(config.VEC_PATH, dtype=config.VEC_DTYPE, mode="r",
-                   shape=(total, config.DIM))
-    vector = np.asarray(mm[row["row"]], dtype=np.float32)
-
     matrix, ids = store.load_matrix(db)
-    scores = search_mod.score_all(matrix, vector)
-
+    scores = search_mod.score_all(matrix, store.read_vector(row["row"]))
     # +1 because the paper matches itself.
-    n = min(args.k + 1, len(ids))
-    top = np.argpartition(-scores, n - 1)[:n]
-    top = top[np.argsort(-scores[top])]
-
-    chosen = [ids[i] for i in top if ids[i] != args.id][:args.k]
-    meta = {
-        r["id"]: dict(r)
-        for r in db.execute(
-            f"SELECT * FROM papers WHERE id IN ({','.join('?' * len(chosen))})",
-            chosen,
-        )
-    }
-    by_id = {ids[i]: float(scores[i]) for i in top}
-    results = [meta[i] | {"score": by_id[i]} for i in chosen]
+    best = [i for i in search_mod.top(scores, args.k + 1)
+            if ids[i] != args.id][:args.k]
+    found = search_mod.papers(db, [ids[i] for i in best])
+    results = [found[ids[i]] | {"score": float(scores[i])} for i in best]
 
     print(f"\nSimilar to: {' '.join(row['title'].split())}")
     print_results(results, full=args.full, scores=args.scores)
@@ -203,7 +187,7 @@ def cmd_status(args, db=None) -> None:
              if slots > total - pending else ""))
 
     # Every category either side knows of: yours, and whatever else the index
-    # holds -- another reader's, or one since dropped from your settings.
+    # holds -- one since dropped from your settings, or brought by an import.
     held = update_mod.cursors(db)
     mine = settings.categories()
     print("\nCategory          papers   complete to        (incl. cross-lists)")
@@ -259,7 +243,7 @@ def cmd_compact(args) -> None:
     tmp.replace(config.VEC_PATH)
     db.commit()
     print(f"Compacted {slots:,} -> {len(rows):,} slots "
-          f"({(slots - len(rows)) * config.DIM * 2 / 1e6:.0f} MB reclaimed).")
+          f"({(slots - len(rows)) * store.SLOT_BYTES / 1e6:.0f} MB reclaimed).")
 
 
 # --- Argument parsing -------------------------------------------------------

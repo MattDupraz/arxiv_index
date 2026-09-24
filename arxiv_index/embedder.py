@@ -63,6 +63,34 @@ def embed_query(query: str) -> np.ndarray:
                  options=config.OLLAMA_QUERY_OPTIONS)[0]
 
 
+def embedding_models() -> list:
+    """The installed Ollama models that can embed, as {"name", "dim"}.
+
+    Ollama says which models embed and how long their vectors are. One that
+    does not say (an older Ollama) is included, its length found by embedding
+    a word with it.
+    """
+    try:
+        installed = [m.model for m in ollama.list().models]
+    except Exception as exc:  # noqa: BLE001
+        raise SystemExit(f"Cannot reach Ollama ({exc}). Is it running?") from exc
+    out = []
+    for name in installed:
+        shown = ollama.show(name)
+        capabilities = getattr(shown, "capabilities", None)
+        if capabilities is not None and "embedding" not in capabilities:
+            continue
+        dim = next((v for k, v in (shown.modelinfo or {}).items()
+                    if k.endswith(".embedding_length")), None)
+        if dim is None:
+            try:
+                dim = len(ollama.embed(model=name, input="dimension").embeddings[0])
+            except Exception:  # noqa: BLE001 - not an embedding model after all
+                continue
+        out.append({"name": name, "dim": int(dim)})
+    return out
+
+
 def check_available() -> None:
     """Fail early with a useful message if the model is not pulled."""
     try:

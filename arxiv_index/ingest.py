@@ -16,12 +16,13 @@ from . import config, embedder, store
 
 
 @contextlib.contextmanager
-def _embed_lock():
-    """Serialise embedding runs across processes.
+def embed_lock():
+    """Serialise writes to the vector file across processes.
 
-    Two concurrent runs would both see the same `row IS NULL` rows and embed
-    them twice, appending duplicate slots and wasting GPU time. A cron `update`
-    firing during a long `build` is the obvious way to hit this.
+    Two concurrent embedding runs would both see the same `row IS NULL` rows
+    and embed them twice, appending duplicate slots and wasting GPU time; a
+    cron `update` firing during a long `build` is the obvious way to hit this.
+    Exports and imports take it too, so the files hold still under them.
     """
     config.INDEX_DIR.mkdir(parents=True, exist_ok=True)
     path = config.INDEX_DIR / "embed.lock"
@@ -125,7 +126,7 @@ def scan_lines(db, categories, lines, name: str, chunk: int = 20_000,
         log(f"No papers at all in {', '.join(empty)} -- check the name "
             f"against https://arxiv.org/category_taxonomy.")
     if newest:
-        from . import update
+        from . import update    # which imports this module
 
         update.set_cursors(db, {c: update.day_cursor(newest)
                                 for c, n in found.items() if n})
@@ -151,7 +152,7 @@ def embed_pending(db, batch_size: int = None, log=print, progress=None) -> int:
     done = 0
     started = time.monotonic()
 
-    with _embed_lock():
+    with embed_lock():
         # Re-read under the lock: a run that just finished may have drained it.
         total = store.count_pending(db) or total
         for rows in store.pending_batches(db, batch_size):

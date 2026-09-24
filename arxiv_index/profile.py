@@ -6,8 +6,7 @@ the reader actually works on, each carrying a weight. Both are edited from the
 web UI.
 
 They live in the reader's settings file (see settings.py), not in the index:
-the profile belongs to a person, and an index may be shared between several,
-or handed to someone else.
+the profile belongs to a person, and an index may be handed to someone else.
 
 Each interest's embedding is cached **keyed by its exact text**. That is what
 makes the invariant cheap to hold: an entry can never be ranked by the vector
@@ -53,8 +52,8 @@ MAX_WEIGHT = 2.0
 # How much a second, third, ... matching interest adds; see `blend_decay`.
 DEFAULT_BLEND = 0.35
 
-# Little-endian float32, stated rather than left to the platform so that an
-# index copied between machines reads back the vectors it stored. float32 and
+# Little-endian float32, stated rather than left to the platform so that a
+# cache copied between machines reads back the vectors it stored. float32 and
 # not the corpus's float16: this is the query side, which the search path keeps
 # in float32 throughout.
 VECTOR_DTYPE = "<f4"

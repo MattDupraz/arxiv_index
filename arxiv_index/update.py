@@ -35,7 +35,7 @@ import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 
-from . import config, settings, store
+from . import config, ingest, settings, store
 
 API = "https://export.arxiv.org/api/query"
 NS = {
@@ -59,8 +59,6 @@ MAX_PAGES = 500
 # {category: ISO timestamp}, one cursor per category the index holds. See
 # `cursors` for why per category.
 CURSORS_KEY = "arxiv_cursors"
-# The single cursor this replaced, from when the scope was fixed.
-LEGACY_CURSOR_KEY = "arxiv_cursor"
 
 
 # --- Parsing ----------------------------------------------------------------
@@ -276,41 +274,21 @@ def cursors(db) -> dict:
     A category is only given a cursor once its backfill has finished, so the
     keys are also the answer to "which categories does this index hold".
     """
-    stored = store.get_meta(db, CURSORS_KEY)
-    if stored:
-        try:
-            parsed = json.loads(stored)
-        except ValueError:
-            parsed = {}
-        out = {}
-        for cat, stamp in parsed.items() if isinstance(parsed, dict) else ():
-            stamp = _parse_stamp(stamp)
-            if stamp:
-                out[cat] = stamp
-        return out
-
-    # An index from before categories were configurable. Its scope was the
-    # three that were then hard-coded, all sharing one cursor -- or, if it was
-    # never updated, the newest paper held.
-    if not store.count_papers(db):
+    try:
+        parsed = json.loads(store.get_meta(db, CURSORS_KEY) or "{}")
+    except ValueError:
         return {}
-    stamp = _parse_stamp(store.get_meta(db, LEGACY_CURSOR_KEY) or "")
-    if stamp is None:
-        row = db.execute("SELECT MAX(update_date) AS d FROM papers").fetchone()
-        stamp = day_cursor(row["d"]) if row and row["d"] else None
-    if stamp is None:
-        return {}
-    out = {cat: stamp for cat in settings.DEFAULT_CATEGORIES}
-    set_cursors(db, out)
-    db.execute("DELETE FROM meta WHERE key = ?", (LEGACY_CURSOR_KEY,))
-    db.commit()
+    out = {}
+    for cat, stamp in parsed.items() if isinstance(parsed, dict) else ():
+        stamp = _parse_stamp(stamp)
+        if stamp:
+            out[cat] = stamp
     return out
 
 
 def set_cursors(db, values: dict) -> None:
     """Set the cursor of each category in `values`, keeping the rest."""
-    merged = cursors(db) if store.get_meta(db, CURSORS_KEY) else {}
-    merged.update(values)
+    merged = cursors(db) | values
     store.set_meta(db, CURSORS_KEY, json.dumps(
         {cat: stamp.isoformat(timespec="seconds")
          for cat, stamp in sorted(merged.items())}))
@@ -329,9 +307,8 @@ def update(db, max_pages: int = MAX_PAGES, log=print, progress=None) -> int:
     Both default to the CLI's behaviour; the web UI passes its own so the run
     can be watched from the page that started it.
 
-    Every category the index holds is kept current, not only the reader's:
-    on a shared index, someone else's categories would otherwise go stale
-    whenever it was this reader's server doing the fetching.
+    Every category the index holds is kept current, including any since
+    dropped from the settings or brought in by an import.
 
     One walk covers them all, back to the oldest cursor, and on success every
     cursor moves to the same point. A newly backfilled category thus makes one
@@ -363,9 +340,6 @@ def update(db, max_pages: int = MAX_PAGES, log=print, progress=None) -> int:
             f"{pending - added:,} revised, "
             f"{len(records) - pending:,} already current "
             f"({pending:,} to embed).")
-
-        from . import ingest
-
         embedded = ingest.embed_pending(db, log=log, progress=progress)
     else:
         log("No new papers.")

@@ -66,12 +66,12 @@ CPython returns very little to the OS once it has grown:
 - Vectors are L2-normalised before storage, so cosine is a plain dot product.
 - float16 storage halves bytes read per search; round-trip error ~1e-5.
 
-Change `MODEL` in `config.py` and the index refuses to load rather than silently
-mixing incomparable vectors.
+Name another model under `"embedding"` in the settings and the index refuses to
+load rather than silently mixing incomparable vectors.
 
 **The query embedding runs on the CPU**: 175 ms against 89 ms on the GPU, in
-exchange for 4.1 GB of VRAM left to the vector matrix and to builds. Indexing keeps the GPU at
-14.1 docs/s.
+exchange for 4.1 GB of VRAM left to the vector matrix and to builds. Indexing
+keeps the GPU at 14.1 docs/s.
 
 `num_gpu` must be stated explicitly on **both** paths. Ollama does not move a
 model back on its own — once loaded with `num_gpu: 0` it stays on the CPU, and a
@@ -82,7 +82,7 @@ reload each way, so searches issued *during* an update will thrash.
 
 **Ollama's embeddings are not deterministic**: reduction order depends on
 batching, so the same query can come back ~4e-3 apart, `cos 0.9996`. Query
-embeddings are therefore memoised on `(query, model)` — mainly a latency win
+embeddings are therefore memoised on the query text — mainly a latency win
 (~104 ms per repeat, and the UI resubmits the same text whenever you change a
 filter), with reproducibility as a side effect. The instability was harmless:
 papers 3e-3 apart in cosine are ties.

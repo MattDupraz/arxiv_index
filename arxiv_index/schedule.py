@@ -10,14 +10,13 @@ config dict and two timestamps, which is what makes the awkward part -- "is a
 run due, given it last ran then?" -- something that can be checked directly
 rather than by waiting around for a scheduler.
 
-The setting lives in the reader's settings file beside the profile: it is a
-choice made by whoever runs the server, not a property of the index. When a
-run last started is the reverse -- it is about the index, and whoever else
-tops up a shared one should reset the clock too -- so that stays in papers.db.
+The setting lives in the settings file beside the profile: it is a choice
+made by whoever runs the server. When a run last started is about the index
+instead, so that stays in papers.db.
 
 Two modes, which together are the frequency and the timing:
 
-    interval   every N hours, measured from the end of the last run
+    interval   every N hours, from when the last run started
     daily      at a wall-clock time, local to the machine running the server
 
 Local time, not UTC, and deliberately: someone asking for 07:00 means 07:00

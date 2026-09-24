@@ -30,9 +30,9 @@ standard library can read TOML but not write it. The file is re-read on every
 use, so a hand edit is picked up without a restart -- except `categories` and
 `embedding`, which a running server fixes at start.
 
-`embedding` is the odd one out: it describes the index rather than the reader.
-Everyone sharing an index has to name the model it was built with, and
-`store.check_model` refuses anything else.
+`embedding` is the odd one out: it describes the index rather than the reader,
+and has to name the model the index was built with; `store.check_model`
+refuses anything else.
 
 The embeddings of the interests are *not* kept here: 10 KB of base64 per entry
 would bury the text someone may want to edit by hand. They go in a cache keyed
@@ -47,10 +47,11 @@ import threading
 from pathlib import Path
 
 
-def _home() -> Path:
-    """Where the index lives, and the settings file unless it is moved."""
+def home() -> Path:
+    """The directory holding the index, this file and the cache."""
     override = os.environ.get("ARXIV_INDEX_DIR")
     return Path(override).expanduser() if override else Path.home() / ".arxiv_index"
+
 
 DEFAULT_CATEGORIES = ("math.AC", "math.AG", "math.CO")
 
@@ -59,10 +60,6 @@ DEFAULT_CATEGORIES = ("math.AC", "math.AG", "math.CO")
 # reported when the file is read, rather than by an update that quietly finds
 # nothing.
 CATEGORY = re.compile(r"[a-z][a-z-]*(\.[A-Za-z][A-Za-z-]*)?")
-
-# Keys that used to live in the index's `meta` table. See migrate_legacy.
-LEGACY_KEYS = ("followed_authors", "interests", "interests_vector",
-               "interests_blend", "auto_update")
 
 # Read-modify-write of the file is serialised within a process. Across
 # processes only the web server writes it, so nothing more is needed.
@@ -79,11 +76,11 @@ class SettingsError(SystemExit):
 
 
 def path() -> Path:
-    return _home() / "config.json"
+    return home() / "config.json"
 
 
-def cache_dir() -> Path:
-    return _home()
+def cache_path() -> Path:
+    return home() / "interest-vectors.json"
 
 
 def load() -> dict:
@@ -170,17 +167,6 @@ def categories() -> list:
     return clean_categories(get("categories", list(DEFAULT_CATEGORIES)))
 
 
-def index_dir() -> Path:
-    if "index_dir" in load():
-        # Refused rather than ignored, or a file written for an earlier
-        # version would quietly be read against a different index.
-        raise SettingsError(
-            f'"index_dir" in {path()} is no longer read. Remove it; '
-            "$ARXIV_INDEX_DIR moves the directory holding both this file "
-            "and the index.")
-    return _home()
-
-
 def embedding(default: dict, data: dict = None, where=None) -> dict:
     """The embedding model and how to prompt it, over `default`.
 
@@ -228,74 +214,6 @@ def embedding(default: dict, data: dict = None, where=None) -> dict:
     return out
 
 
-def migrate_legacy(db, embedder: dict) -> bool:
-    """Move a profile stored in the index into this file. True if it did.
-
-    Earlier versions kept the profile and the auto-update setting in the
-    index's `meta` table. They are copied here -- the interest vectors into the
-    cache -- and only then deleted from the index, so an interruption leaves
-    them in place for the next attempt. A key already set in this file wins:
-    it is the newer of the two.
-    """
-    rows = {r[0]: r[1] for r in db.execute(
-        f"SELECT key, value FROM meta WHERE key IN "
-        f"({','.join('?' * len(LEGACY_KEYS))})", LEGACY_KEYS)}
-    if not rows:
-        return False
-
-    with _lock:
-        current = load()
-        values, vectors = {}, {}
-        if "followed_authors" in rows and "followed_authors" not in current:
-            try:
-                values["followed_authors"] = json.loads(rows["followed_authors"])
-            except ValueError:
-                pass
-        if "interests" in rows and "interests" not in current:
-            try:
-                parsed = json.loads(rows["interests"])
-            except ValueError:
-                # The single-paragraph format, with its vector alongside.
-                parsed = [{"text": rows["interests"],
-                           "vector": rows.get("interests_vector", "")}]
-            if isinstance(parsed, list):
-                entries = []
-                for entry in parsed:
-                    if not isinstance(entry, dict):
-                        continue
-                    text = " ".join(str(entry.get("text", "")).split())
-                    if not text:
-                        continue
-                    entries.append({"text": text,
-                                    "weight": entry.get("weight", 1.0)})
-                    if isinstance(entry.get("vector"), str) and entry["vector"]:
-                        vectors[text] = entry["vector"]
-                values["interests"] = entries
-        if "interests_blend" in rows and "interests_blend" not in current:
-            try:
-                values["interests_blend"] = float(rows["interests_blend"])
-            except ValueError:
-                pass
-        if "auto_update" in rows and "auto_update" not in current:
-            try:
-                values["auto_update"] = json.loads(rows["auto_update"])
-            except ValueError:
-                pass
-        if "categories" not in current:
-            # Whoever built this index with a profile in it was using the
-            # categories that were then hard-coded.
-            values["categories"] = list(DEFAULT_CATEGORIES)
-
-        if vectors:
-            merge_vector_cache(embedder, vectors)
-        update(**values)
-
-    db.execute(f"DELETE FROM meta WHERE key IN "
-               f"({','.join('?' * len(LEGACY_KEYS))})", LEGACY_KEYS)
-    db.commit()
-    return True
-
-
 # --- Interest vector cache ---------------------------------------------------
 # {"embedding": {"model": ..., "query_prefix": ...}, "vectors": {text: base64}}.
 # Keyed by the exact text, so a vector can never outlive the wording it was
@@ -303,13 +221,9 @@ def migrate_legacy(db, embedder: dict) -> bool:
 # vectors made the old way.
 
 
-def _cache_path() -> Path:
-    return cache_dir() / "interest-vectors.json"
-
-
 def read_vector_cache(embedder: dict) -> dict:
     try:
-        data = json.loads(_cache_path().read_text(encoding="utf-8"))
+        data = json.loads(cache_path().read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {}
     if not isinstance(data, dict) or data.get("embedding") != embedder:
@@ -326,7 +240,7 @@ def merge_vector_cache(embedder: dict, vectors: dict, keep=None) -> None:
         current.update(vectors)
         if keep is not None:
             current = {t: v for t, v in current.items() if t in keep}
-        target = _cache_path()
+        target = cache_path()
         target.parent.mkdir(parents=True, exist_ok=True)
         tmp = target.with_name(target.name + ".tmp")
         tmp.write_text(json.dumps({"embedding": embedder, "vectors": current}),

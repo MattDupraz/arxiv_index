@@ -14,7 +14,9 @@ written before the database points at them (store.append_vectors), that order
 would be safe even without the lock.
 
 Importing either installs the export in place of the index (with nothing
-there, or with --replace), or merges it in (--merge): see merge().
+there, or with --replace), or merges it in (--merge): see _merge. Into an index
+with no papers yet -- a fresh install -- the export also brings its embedding
+model and its categories, rather than having to match what the settings say.
 
 Both work on streams as well as files, for the web UI: an export is written
 straight into the HTTP response, with its exact size known beforehand, and an
@@ -32,13 +34,12 @@ import time
 
 import numpy as np
 
-from . import config, ingest, settings, store, update as update_mod
+from . import config, embedder, ingest, settings, store, update as update_mod
 
 MEMBERS = ("papers.db", "vectors.f16")
 # Only when the settings are exported too.
 SETTINGS = "config.json"
 CACHE = "interest-vectors.json"
-
 
 BLOCK = tarfile.BLOCKSIZE          # 512
 RECORD = tarfile.RECORDSIZE        # the archive is padded to a multiple of this
@@ -88,7 +89,7 @@ def exporting(with_settings: bool = False):
     db = store.connect()
     copy = config.INDEX_DIR / "papers.db.exporting"
     try:
-        with ingest._embed_lock():
+        with ingest.embed_lock():
             # The backup API gives a consistent copy of a live database,
             # WAL and all, which copying the file would not.
             out = sqlite3.connect(copy)
@@ -101,7 +102,7 @@ def exporting(with_settings: bool = False):
                                 config.VEC_PATH.stat().st_size))
             if with_settings:
                 for name, path in ((SETTINGS, settings.path()),
-                                   (CACHE, settings.cache_dir() / CACHE)):
+                                   (CACHE, settings.cache_path())):
                     if path.is_file():
                         data = path.read_bytes()
                         members.append((name, data, len(data)))
@@ -138,20 +139,36 @@ def import_(source, replace: bool = False, merge: bool = False,
                       take_settings=take_settings)
 
 
+def _is_empty() -> bool:
+    """Whether there is no index here yet, or one with no papers."""
+    if not config.DB_PATH.exists():
+        return True
+    db = sqlite3.connect(config.DB_PATH)
+    try:
+        return not db.execute("SELECT COUNT(*) FROM papers").fetchone()[0]
+    except sqlite3.DatabaseError:
+        return False
+    finally:
+        db.close()
+
+
 def import_stream(fileobj, source: str, replace: bool = False,
                   merge: bool = False, take_settings: bool = False, log=print,
-                  on_read=None) -> bool:
+                  on_read=None) -> dict:
     """Import the export read from `fileobj`, sequentially, as it comes.
-    Returns whether its settings were taken up.
 
     Everything is unpacked beside the index first; `on_read` is called once
     the stream has been read to the end of the archive, and only then is the
     export checked and merged or installed. A stream that ends early raises
     before anything has been replaced. So do settings that cannot be used,
     when they were asked for.
+
+    Returns {"settings": taken up, "model": the embedding model the settings
+    now name, "model_changed": whether that differs from this process's}.
     """
+    fresh = _is_empty()
     existing = config.DB_PATH.exists()
-    if existing and not (replace or merge):
+    if existing and not fresh and not (replace or merge):
         raise SystemExit(
             f"There is already an index at {config.INDEX_DIR}. Import with "
             "--merge to add the export's papers to it, --replace to overwrite "
@@ -177,12 +194,16 @@ def import_stream(fileobj, source: str, replace: bool = False,
                              "papers.db.")
         if on_read:
             on_read()
-        _check(staged, source)
+        meta = _check(staged, source, adopt=fresh)
         has_settings = SETTINGS in seen
         taking = take_settings and has_settings
         if taking:
-            _check_settings(staged[SETTINGS], source)
-        if existing and merge:
+            _check_settings(staged[SETTINGS], source, adopt=fresh)
+        if fresh:
+            embedding = _index_embedding(
+                meta, staged[SETTINGS] if has_settings else None)
+            held = _held_categories(staged["papers.db"])
+        if existing and merge and not fresh:
             _merge(staged, log=log)
         else:
             _install(staged)
@@ -194,7 +215,11 @@ def import_stream(fileobj, source: str, replace: bool = False,
         elif has_settings:
             log(f"{source} also holds its settings; they were left out, "
                 "and yours are unchanged.")
-        return taking
+        model = config.MODEL
+        if fresh:
+            model = _adopt(embedding, None if taking else held, log)
+        return {"settings": taking, "model": model,
+                "model_changed": model != config.MODEL}
     finally:
         for path in staged.values():
             path.unlink(missing_ok=True)
@@ -202,23 +227,120 @@ def import_stream(fileobj, source: str, replace: bool = False,
 
 def _install(staged) -> None:
     """Put the export's two files in place of the index's."""
-    with ingest._embed_lock():
-            # A replaced database's WAL would be replayed into the new one.
-            for suffix in ("-wal", "-shm"):
-                config.DB_PATH.with_name(config.DB_PATH.name + suffix).unlink(
-                    missing_ok=True)
-            os.replace(staged["papers.db"], config.DB_PATH)
-            if staged["vectors.f16"].exists():
-                os.replace(staged["vectors.f16"], config.VEC_PATH)
-            else:
-                config.VEC_PATH.unlink(missing_ok=True)
+    with ingest.embed_lock():
+        # A replaced database's WAL would be replayed into the new one.
+        for suffix in ("-wal", "-shm"):
+            config.DB_PATH.with_name(config.DB_PATH.name + suffix).unlink(
+                missing_ok=True)
+        os.replace(staged["papers.db"], config.DB_PATH)
+        if staged["vectors.f16"].exists():
+            os.replace(staged["vectors.f16"], config.VEC_PATH)
+        else:
+            config.VEC_PATH.unlink(missing_ok=True)
 
 
-def _check_settings(path, source) -> None:
+def _check(staged, source, adopt: bool = False) -> dict:
+    """Refuse an export whose vectors this reader cannot use, or whose two
+    files do not match, before anything is replaced. Returns its meta table.
+
+    With `adopt` the export's model is taken up rather than checked against
+    the settings: the index here is empty, so there is nothing to match."""
+    db = sqlite3.connect(staged["papers.db"])
+    try:
+        meta = dict(db.execute("SELECT key, value FROM meta").fetchall())
+        highest = db.execute("SELECT MAX(row) FROM papers").fetchone()[0]
+    except sqlite3.DatabaseError as exc:
+        raise SystemExit(f"{source} does not hold a usable papers.db: {exc}")
+    finally:
+        db.close()
+
+    wrong = None if adopt else store.embedding_mismatch(meta)
+    if wrong:
+        key, stored, current = wrong
+        raise SystemExit(
+            f"{source} was built with {key} {stored!r}, but your settings "
+            f"give {current!r}. Set \"embedding\" in {settings.path()} to "
+            "match it, then import again.")
+
+    vectors = staged["vectors.f16"]
+    size = vectors.stat().st_size if vectors.exists() else 0
+    try:
+        dim = int(meta.get("dim") or config.DIM)
+    except ValueError:
+        raise SystemExit(f"{source} is damaged: its dim is not a number.")
+    width = dim * np.dtype(config.VEC_DTYPE).itemsize
+    if size % width or (highest is not None and highest >= size // width):
+        raise SystemExit(f"{source} is damaged: its vectors do not match its "
+                         "papers.")
+    return meta
+
+
+def _index_embedding(meta: dict, settings_file) -> dict:
+    """The "embedding" setting that describes an export's vectors.
+
+    The model, dimension and document prefix are recorded in its index. The
+    query prefix is not -- it only shapes searches -- so it comes from the
+    export's own settings if they name the same model, and otherwise is the
+    default's for the default model and none for any other.
+    """
+    default = config.DEFAULT_EMBEDDING
+    model = meta.get("model") or default["model"]
+    out = {"model": model, "dim": int(meta.get("dim") or default["dim"]),
+           "document_prefix": meta.get("document_prefix", "")}
+    theirs = {}
+    if settings_file is not None:
+        try:
+            theirs = json.loads(settings_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            pass
+    theirs = theirs.get("embedding") if isinstance(theirs, dict) else None
+    if (isinstance(theirs, dict) and isinstance(theirs.get("query_prefix"), str)
+            and theirs.get("model", default["model"]) == model):
+        out["query_prefix"] = theirs["query_prefix"]
+    else:
+        out["query_prefix"] = (default["query_prefix"]
+                               if model == default["model"] else "")
+    if out == default:
+        return {"model": model}     # the defaults need not be spelled out
+    return out
+
+
+def _held_categories(db_path) -> list:
+    """The categories an export's index holds, in their usual order."""
+    db = sqlite3.connect(db_path)
+    db.row_factory = sqlite3.Row
+    try:
+        return sorted(update_mod.cursors(db))
+    finally:
+        db.close()
+
+
+def _adopt(embedding: dict, categories, log) -> str:
+    """Name the imported index's model in the settings, and its categories
+    unless its settings were taken up with their own. Returns the model."""
+    values = {"embedding": embedding}
+    if categories:
+        values["categories"] = categories
+    settings.update(**values)
+    model = embedding["model"]
+    log(f"This index now uses the embedding model {model}"
+        + (f", and covers {', '.join(categories)}." if categories else "."))
+    try:
+        installed = {m["name"] for m in embedder.embedding_models()}
+    except SystemExit:
+        installed = None
+    if installed is not None and model not in installed:
+        log(f"{model} is not installed in Ollama; searching needs it: "
+            f"ollama pull {model}")
+    return model
+
+
+def _check_settings(path, source, adopt: bool = False) -> None:
     """Refuse an export's settings that could not be used here, before
     anything is replaced: not a settings file, categories that are not, or a
     different embedding model from the one the index here is searched with
-    (which the export's own index must match, so this is a file edited since)."""
+    (which the export's own index must match, so this is a file edited since).
+    With `adopt` the model is the export's anyway; see _index_embedding."""
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
@@ -232,7 +354,7 @@ def _check_settings(path, source) -> None:
         theirs = settings.embedding(config.DEFAULT_EMBEDDING, data, where)
     except settings.SettingsError as exc:
         raise SystemExit(str(exc))
-    if theirs != config.EMBEDDING:
+    if not adopt and theirs != config.EMBEDDING:
         raise SystemExit(
             f"The settings in {source} name the embedding model "
             f"{theirs['model']!r}, but this index is searched with "
@@ -249,7 +371,7 @@ def _take_settings(staged, log) -> None:
     target.parent.mkdir(parents=True, exist_ok=True)
     os.replace(staged[SETTINGS], target)
     if staged[CACHE].exists():
-        os.replace(staged[CACHE], settings.cache_dir() / CACHE)
+        os.replace(staged[CACHE], settings.cache_path())
     log("Took up the export's settings"
         + (f"; yours are kept in {target.name}.bak." if kept else "."))
 
@@ -292,14 +414,12 @@ def _merge(staged, batch: int = 5000, log=print) -> None:
     store.check_model(db)
     theirs = sqlite3.connect(staged["papers.db"])
     theirs.row_factory = sqlite3.Row
-    width = config.DIM
-    slots = (staged["vectors.f16"].stat().st_size
-             // (width * np.dtype(config.VEC_DTYPE).itemsize)
+    slots = (staged["vectors.f16"].stat().st_size // store.SLOT_BYTES
              if staged["vectors.f16"].exists() else 0)
     source = (np.memmap(staged["vectors.f16"], dtype=config.VEC_DTYPE,
-                        mode="r", shape=(slots, width)) if slots else None)
+                        mode="r", shape=(slots, config.DIM)) if slots else None)
 
-    with ingest._embed_lock():
+    with ingest.embed_lock():
         ours = {r["id"]: (_key(r), r["row"] is not None) for r in db.execute(
             "SELECT id, version, update_date, row FROM papers")}
         added = updated = kept = 0
@@ -357,30 +477,3 @@ def _merge(staged, batch: int = 5000, log=print) -> None:
         log(f"{reclaimable:,} vector slots are no longer used; `compact` "
             "reclaims them.")
 
-
-def _check(staged, source) -> None:
-    """Refuse an export whose vectors this reader cannot use, or whose two
-    files do not match, before anything is replaced."""
-    db = sqlite3.connect(staged["papers.db"])
-    try:
-        meta = dict(db.execute("SELECT key, value FROM meta").fetchall())
-        highest = db.execute("SELECT MAX(row) FROM papers").fetchone()[0]
-    except sqlite3.DatabaseError as exc:
-        raise SystemExit(f"{source} does not hold a usable papers.db: {exc}")
-    finally:
-        db.close()
-
-    for key, current in (("model", config.MODEL), ("dim", str(config.DIM)),
-                         ("document_prefix", config.DOCUMENT_PREFIX)):
-        if meta.get(key) is not None and meta[key] != current:
-            raise SystemExit(
-                f"{source} was built with {key} {meta[key]!r}, but your "
-                f"settings give {current!r}. Set \"embedding\" in "
-                f"{settings.path()} to match it, then import again.")
-
-    vectors = staged["vectors.f16"]
-    size = vectors.stat().st_size if vectors.exists() else 0
-    width = config.DIM * np.dtype(config.VEC_DTYPE).itemsize
-    if size % width or (highest is not None and highest >= size // width):
-        raise SystemExit(f"{source} is damaged: its vectors do not match its "
-                         "papers.")

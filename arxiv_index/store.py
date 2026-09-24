@@ -59,23 +59,37 @@ def connect(check_same_thread: bool = True) -> sqlite3.Connection:
     # turn rather than fail outright.
     db.execute("PRAGMA busy_timeout=10000")
     db.executescript(SCHEMA)
-    set_meta_defaults(db)
-    if settings.migrate_legacy(db, config.QUERY_EMBEDDER):
-        print(f"Moved the profile out of the index into {settings.path()}.")
+    # What the vectors are made with, recorded once when the index is created
+    # and checked ever after; see check_model.
+    for key, value in _embedding():
+        db.execute("INSERT OR IGNORE INTO meta VALUES (?, ?)", (key, value))
+    db.commit()
     return db
 
 
-def set_meta_defaults(db: sqlite3.Connection) -> None:
-    # An index from before the prefix was recorded was built with none: it is
-    # stated here as the default rather than taken from the settings, which
-    # may since have changed.
-    had_model = get_meta(db, "model") is not None
-    defaults = (("model", config.MODEL), ("dim", str(config.DIM)),
-                ("document_prefix",
-                 "" if had_model else config.DOCUMENT_PREFIX))
-    for key, value in defaults:
-        db.execute("INSERT OR IGNORE INTO meta VALUES (?, ?)", (key, value))
+def _embedding():
+    """The settings that make vectors comparable, as they are recorded."""
+    return (("model", config.MODEL), ("dim", str(config.DIM)),
+            ("document_prefix", config.DOCUMENT_PREFIX))
+
+
+def forget_embedding(db: sqlite3.Connection) -> None:
+    """Drop the recorded model of an index with no papers yet, so that the
+    next start records the one the settings name instead."""
+    if count_papers(db):
+        raise SystemExit("The index has papers; its model cannot change.")
+    db.execute("DELETE FROM meta WHERE key IN ('model', 'dim', "
+               "'document_prefix')")
     db.commit()
+
+
+def embedding_mismatch(meta: dict):
+    """The first recorded (key, stored, current) that disagrees with the
+    settings, or None. `meta` is an index's meta table."""
+    for key, current in _embedding():
+        if meta.get(key) is not None and meta[key] != current:
+            return key, meta[key], current
+    return None
 
 
 def get_meta(db: sqlite3.Connection, key: str, default=None):
@@ -97,17 +111,16 @@ def check_model(db: sqlite3.Connection) -> None:
     The query prefix is not checked: it changes only how searches are phrased,
     not the vectors already stored, so it is safe to experiment with.
     """
-    for key, current in (("model", config.MODEL), ("dim", str(config.DIM)),
-                         ("document_prefix", config.DOCUMENT_PREFIX)):
-        stored = get_meta(db, key)
-        if stored is not None and stored != current:
-            raise SystemExit(
-                f"Index {config.INDEX_DIR} was built with {key} {stored!r}, but "
-                f"the settings in {settings.path()} give {current!r}.\n"
-                "Vectors made differently are not comparable. Either set "
-                '"embedding" back to what built the index, point $ARXIV_INDEX_DIR '
-                "at a new directory, or rebuild this one from scratch."
-            )
+    wrong = embedding_mismatch(
+        dict(db.execute("SELECT key, value FROM meta").fetchall()))
+    if wrong:
+        key, stored, current = wrong
+        raise SystemExit(
+            f"Index {config.INDEX_DIR} was built with {key} {stored!r}, but "
+            f"the settings in {settings.path()} give {current!r}.\n"
+            "Vectors made differently are not comparable. Either set "
+            '"embedding" back to what built the index, point $ARXIV_INDEX_DIR '
+            "at a new directory, or rebuild this one from scratch.")
 
 
 # --- Metadata ---------------------------------------------------------------
@@ -186,13 +199,22 @@ def pending_batches(db: sqlite3.Connection, size: int):
 
 # --- Vectors ----------------------------------------------------------------
 
+SLOT_BYTES = config.DIM * np.dtype(config.VEC_DTYPE).itemsize
+
 
 def vector_count() -> int:
     """Number of slots currently in the vector file."""
     if not config.VEC_PATH.exists():
         return 0
-    itemsize = np.dtype(config.VEC_DTYPE).itemsize
-    return config.VEC_PATH.stat().st_size // (config.DIM * itemsize)
+    return config.VEC_PATH.stat().st_size // SLOT_BYTES
+
+
+def read_vector(slot: int) -> np.ndarray:
+    """One stored vector, as float32."""
+    with open(config.VEC_PATH, "rb") as fh:
+        fh.seek(slot * SLOT_BYTES)
+        data = fh.read(SLOT_BYTES)
+    return np.frombuffer(data, dtype=config.VEC_DTYPE).astype(np.float32)
 
 
 def normalise(vectors: np.ndarray) -> np.ndarray:
