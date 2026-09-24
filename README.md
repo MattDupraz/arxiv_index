@@ -27,18 +27,30 @@ ollama pull qwen3-embedding:4b
 To use a different model, pull it too; setting up asks which to use. An index
 keeps its model for good.
 
-**2. Install it.** Python 3.11 or newer:
+**2. Get the code**, with Python 3.11 or newer, and either install it or run it
+from where it is:
 
 ```bash
 git clone https://github.com/MattDupraz/arxiv_index.git
+
+# Either install it, which gives an `arxiv_index` command usable anywhere:
 pip install ./arxiv_index
+
+# Or run it without installing: only its two dependencies are installed, and
+# every command is run from the repository, as `python3 -m arxiv_index`:
+pip install numpy ollama
+cd arxiv_index
+python3 -m arxiv_index --help
 ```
 
-This installs the `arxiv_index` command, which works from any directory, and
-its two dependencies, numpy and ollama. Embedding runs in Ollama, on the GPU if
-Ollama can use one; nothing else needs a GPU. To work on the code, `pip install -e`
-installs it so that edits take effect without reinstalling; and from the
-repository, `python3 -m arxiv_index` runs it without installing at all.
+This README writes commands as `arxiv_index build`, `arxiv_index serve` and so
+on. Without installing, each is `python3 -m arxiv_index build`,
+`python3 -m arxiv_index serve`, and so on, run from the repository directory:
+`python3 -m` finds the code there, and only there. To work on the code,
+`pip install -e ./arxiv_index` gives the command while keeping edits live.
+
+Embedding runs in Ollama, on the GPU if Ollama can use one; nothing else needs
+a GPU.
 
 **3. Get the papers**, from one of two sources:
 
@@ -384,9 +396,16 @@ arxiv_index`) if cron's `PATH` does not reach it:
 0 7 * * 1  arxiv_index update >> ~/.arxiv_index/update.log 2>&1
 ```
 
+Without installing, run it from the repository instead:
+
+```cron
+0 7 * * 1  cd /path/to/arxiv_index && python3 -m arxiv_index update >> ~/.arxiv_index/update.log 2>&1
+```
+
 ## Commands
 
-`arxiv_index <command>`; every command takes `--help`.
+`arxiv_index <command>`, or `python3 -m arxiv_index <command>` from the
+repository without installing; every command takes `--help`.
 
 | | |
 |---|---|
