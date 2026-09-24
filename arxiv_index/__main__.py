@@ -7,8 +7,8 @@ import textwrap
 
 import numpy as np
 
-from . import (config, ingest, search as search_mod, store, textnorm,
-               update as update_mod)
+from . import (config, ingest, search as search_mod, settings, store,
+               textnorm, update as update_mod)
 
 
 # --- Output -----------------------------------------------------------------
@@ -59,7 +59,14 @@ def cmd_build(args) -> None:
     db = store.connect()
     store.check_model(db)
     if not args.embed_only:
-        ingest.scan_snapshot(db, chunk=20_000)
+        # Only the categories the index does not hold yet. The rest are kept
+        # current by `update`, and the snapshot's copies would be older.
+        missing = update_mod.missing(db)
+        if missing:
+            ingest.scan_snapshot(db, missing, chunk=20_000)
+        else:
+            print(f"The index already holds "
+                  f"{', '.join(settings.categories())}; nothing to scan.")
     ingest.embed_pending(db)
     cmd_status(args, db)
 
@@ -75,8 +82,15 @@ def cmd_search(args) -> None:
             "Give a query, or at least one of --author / --category / --since."
         )
     db = store.connect()
+    categories = args.category
+    if not categories and set(update_mod.cursors(db)) - set(
+            settings.categories()):
+        # A shared index holding others' categories: keep to your own. On an
+        # index holding only yours this would be a no-op filter that costs a
+        # copy of the matrix, so it is skipped.
+        categories = settings.categories()
     results = search_mod.search(
-        db, args.query, k=args.k, categories=args.category, since=args.since,
+        db, args.query, k=args.k, categories=categories, since=args.since,
         author=args.author, rerank=args.rerank,
     )
     if args.json:
@@ -154,25 +168,43 @@ def cmd_status(args, db=None) -> None:
     slots = store.vector_count()
     size = config.VEC_PATH.stat().st_size / 1e6 if config.VEC_PATH.exists() else 0
 
-    print(f"\nIndex:      {config.INDEX_DIR}")
+    print(f"\nSettings:   {settings.path()}"
+          + ("" if settings.path().exists() else "  (not created yet)"))
+    print(f"Index:      {config.INDEX_DIR}")
     print(f"Model:      {store.get_meta(db, 'model')} ({config.DIM} dims, "
           f"{config.VEC_DTYPE})")
-    print(f"Scope:      {', '.join(config.CATEGORIES)} (incl. cross-lists)")
     print(f"Papers:     {total:,}   embedded {total - pending:,}, "
           f"pending {pending:,}")
     print(f"Vectors:    {slots:,} slots, {size:,.0f} MB"
           + (f"  ({slots - (total - pending):,} reclaimable)"
              if slots > total - pending else ""))
-    print(f"Cursor:     {update_mod.default_cursor(db):%Y-%m-%d %H:%M} UTC")
 
-    per_cat = []
-    for cat in config.CATEGORIES:
+    # Every category either side knows of: yours, and whatever else the index
+    # holds -- another reader's, or one since dropped from your settings.
+    held = update_mod.cursors(db)
+    mine = settings.categories()
+    print("\nCategory          papers   complete to        (incl. cross-lists)")
+    for cat in mine + sorted(set(held) - set(mine)):
         n = db.execute(
             "SELECT COUNT(*) FROM papers WHERE ' ' || categories || ' ' LIKE ?",
             (f"% {cat} %",),
         ).fetchone()[0]
-        per_cat.append(f"{cat} {n:,}")
-    print(f"By tag:     {'   '.join(per_cat)}\n")
+        if cat not in held:
+            note = "not in the index -- run `build` to add it"
+        else:
+            note = f"{held[cat]:%Y-%m-%d %H:%M} UTC"
+            if cat not in mine:
+                note += "   not in your settings"
+        print(f"  {cat:<14}{n:>9,}   {note}")
+    print()
+
+
+def cmd_config(args) -> None:
+    """Show the settings file, creating it with the defaults if absent."""
+    if settings.write_default():
+        print(f"Created {settings.path()} with the default categories.\n")
+    print(f"# {settings.path()}")
+    print(settings.path().read_text(encoding="utf-8"), end="")
 
 
 def cmd_compact(args) -> None:
@@ -214,7 +246,8 @@ def main(argv=None) -> None:
     parser = argparse.ArgumentParser(
         prog="arxiv_index",
         description="Semantic search over arXiv "
-                    f"{', '.join(config.CATEGORIES)}.",
+                    f"{', '.join(settings.categories())}. Settings are read "
+                    f"from {settings.path()}, or $ARXIV_INDEX_CONFIG.",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -233,7 +266,8 @@ def main(argv=None) -> None:
     p.add_argument("query", nargs="?", default="",
                    help="omit it to list by --author/--category/--since alone")
     p.add_argument("-k", type=int, default=10, help="number of results")
-    p.add_argument("--category", action="append", choices=config.CATEGORIES,
+    p.add_argument("--category", action="append",
+                   choices=settings.categories(),
                    help="restrict to a category (repeatable)")
     p.add_argument("--author", metavar="NAME[,NAME...]",
                    help="restrict to papers by these authors (all of them, so "
@@ -270,6 +304,10 @@ def main(argv=None) -> None:
 
     p = sub.add_parser("status", help="show index statistics")
     p.set_defaults(func=cmd_status)
+
+    p = sub.add_parser("config", help="show your settings file, creating it "
+                                      "if it does not exist")
+    p.set_defaults(func=cmd_config)
 
     p = sub.add_parser("compact", help="reclaim slots left by re-embedded papers")
     p.set_defaults(func=cmd_compact)

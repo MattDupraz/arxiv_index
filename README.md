@@ -1,10 +1,10 @@
-# arXiv index — math.AC / math.AG / math.CO
+# arXiv index
 
-Semantic search over arXiv abstracts in commutative algebra, algebraic geometry
-and combinatorics, running entirely on your own machine. A paper is in scope if
-**any** of its categories is one of the three, so cross-listed work counts —
-~145,000 papers, 747 MB of vectors. Vector search takes ~210 ms, ~800 ms with
-reranking.
+Semantic search over arXiv abstracts in the categories you choose, running
+entirely on your own machine. A paper is in scope if **any** of its categories
+is one of yours, so cross-listed work counts. With the default math.AC, math.AG
+and math.CO that is ~145,000 papers and 747 MB of vectors; vector search takes
+~210 ms, ~800 ms with reranking.
 
 Day-to-day use is two commands:
 
@@ -18,16 +18,24 @@ python3 -m arxiv_index update     # weekly top-up, about a minute
 The repository is **code only**. A fresh clone can search nothing until you
 build the index: one 5.5 GB download and a few hours of embedding.
 
-1. **Ollama with the embedding model:** `ollama pull qwen3-embedding:4b`.
+1. **Ollama with the embedding model:** `ollama pull qwen3-embedding:4b`, or
+   [another](#another-embedding-model).
 2. **Python 3.11+ with `numpy` and `ollama`.** Everything else is stdlib.
 3. **Optionally torch + transformers**, for reranking and GPU search. Without
    them searches run on the CPU, unreranked.
-4. **The Kaggle snapshot**, for the initial backfill only:
+4. **The Kaggle snapshot**, for backfilling only:
    [kaggle.com/datasets/Cornell-University/arxiv](https://www.kaggle.com/datasets/Cornell-University/arxiv).
    Unzip `arxiv-metadata-oai-snapshot.json` into the repo root. arXiv caps how
    deep a result set can be paged, so the snapshot is the only way to get the
-   history in; it can be deleted once the build finishes.
-5. **Build:**
+   history in; it can be deleted once the build finishes, and fetched again
+   if you later add a category.
+5. **Choose your categories** (see [Settings](#settings)):
+
+```bash
+python3 -m arxiv_index config    # creates the settings file and shows it
+```
+
+6. **Build:**
 
 ```bash
 python3 -m arxiv_index build     # scan the snapshot, then embed
@@ -35,23 +43,89 @@ python3 -m arxiv_index status    # where the index is and what is in it
 python3 -m arxiv_index serve
 ```
 
-The scan takes a couple of minutes; embedding 145k papers takes about three
-hours on a consumer GPU. It is interruptible — `build --embed-only` picks up
-where it stopped. Budget ~910 MB for the finished index.
+The scan takes a couple of minutes. Embedding the default three categories'
+145k papers takes about three hours on a consumer GPU, and more categories take
+proportionally longer. It is interruptible: `build --embed-only` picks up where
+it stopped. Budget ~6.3 KB of disk per paper.
 
-Paths come from `arxiv_index/config.py` (`INDEX_DIR`, `SNAPSHOT`), so pointing
-`INDEX_DIR` at an external disk moves the whole index. Model weights live in
-`~/.ollama` (~2.5 GB) and `~/.cache/huggingface` (~570 MB).
+Model weights live in `~/.ollama` (~2.5 GB) and `~/.cache/huggingface`
+(~570 MB).
+
+## Settings
+
+Everything personal is in one file, beside the index in `~/.arxiv-index/`:
+`~/.arxiv-index/config.json`, or wherever `$ARXIV_INDEX_CONFIG` points.
+Several people can share one index, each with their own file, and handing
+someone a copy of your index does not hand them your profile.
+
+```json
+{
+  "categories": ["math.AC", "math.AG", "math.CO", "math.NT"],
+  "index_dir": "/data/arxiv/index",
+  "snapshot": "~/Downloads/arxiv-metadata-oai-snapshot.json"
+}
+```
+
+| | |
+|---|---|
+| `categories` | the arXiv categories you want, by their full names: `math.AG`, `hep-th`, `cs.LG` ([list](https://arxiv.org/category_taxonomy)). Default: math.AC, math.AG, math.CO |
+| `index_dir` | where the index lives. Default: `~/.arxiv-index` |
+| `snapshot` | where the Kaggle snapshot is. Default: the repo root |
+| `embedding` | the Ollama embedding model. Default: `qwen3-embedding:4b`; see [below](#another-embedding-model) |
+
+Relative paths are read from the settings file's own directory. The profile
+and the automatic-update setting are stored here too, written by the web UI.
+Hand edits are picked up without a restart, except the four keys above, which
+`serve` reads when it starts.
+
+### Another embedding model
+
+```json
+"embedding": {
+  "model": "nomic-embed-text",
+  "dim": 768,
+  "query_prefix": "search_query: ",
+  "document_prefix": "search_document: "
+}
+```
+
+`dim` is the model's embedding length (`ollama show <model>` gives it). The
+prefixes are whatever the model's card says it was trained with, and default
+to none. All the measurements in `config.py` were taken with the default model.
+
+An index is tied to the model that built it. `model`, `dim` and
+`document_prefix` are recorded in it, and anything else is refused, since those
+vectors would not be comparable. To switch models, point `index_dir` at a new
+directory and `build` there. `query_prefix` is free to change at any time.
+
+An index from before this file existed moves its profile here the first time
+it is opened.
+
+### Adding a category
+
+Add it to `categories` and run `build`. That scans the snapshot **for the new
+categories only**, leaving papers already held alone, and the next `update`
+fills in everything since the snapshot was taken. Until then, `status` and the
+web UI list it as not yet in the index. A name that matches no papers in the
+snapshot is reported, since it is most likely a typo.
+
+### Removing one, or sharing an index
+
+Removing a category from your settings hides it rather than deleting it. With
+no category ticked, searches cover **your** categories. An index holding others
+(someone else's, or ones you dropped) keeps them out of your results, but
+`update` still keeps every category in the index current, so that whoever runs
+it does not leave the others' categories to go stale.
 
 ### The two index files are a matched set
 
-`index/papers.db` is the source of truth: each paper's `row` column names its
-slot in `index/vectors.f16`, which has no identity of its own. **Back them up
+`papers.db` is the source of truth: each paper's `row` column names its
+slot in `vectors.f16`, which has no identity of its own. **Back them up
 together.** If they are separated, the vectors can be rebuilt:
 
 ```bash
-sqlite3 index/papers.db "UPDATE papers SET row = NULL"
-rm index/vectors.f16
+sqlite3 ~/.arxiv-index/papers.db "UPDATE papers SET row = NULL"
+rm ~/.arxiv-index/vectors.f16
 python3 -m arxiv_index build --embed-only
 ```
 
@@ -84,8 +158,8 @@ to.
 
 ### Your profile
 
-Two fields describing *you* rather than a search, stored in the index's `meta`
-table so they travel with `papers.db`:
+Two fields describing *you* rather than a search, stored in your
+[settings file](#settings):
 
 | | |
 |---|---|
@@ -120,7 +194,9 @@ slider is *b*:
 
 Descriptions are embedded on save, so changing a weight or the slider embeds
 nothing. If Ollama is unreachable the text is stored anyway and flagged as
-unrankable until you save again.
+unrankable until you save again. An interest added by editing the settings
+file is embedded the first time you rank. The embeddings are cached in
+`~/.arxiv-index/interest-vectors.json`, which is safe to delete.
 
 ### Searching by author
 
@@ -154,7 +230,7 @@ cursor advances *only* when a walk provably reached it: a run cut short says
 `WALK INCOMPLETE`, keeps what it fetched and leaves the cursor alone, so the
 failure mode is wasted work rather than a gap.
 
-Embedding takes an exclusive lock (`index/embed.lock`), so an `update` firing
+Embedding takes an exclusive lock (`embed.lock` in the index directory), so an `update` firing
 during a long `build` exits cleanly. Searching during a build is fine.
 
 From the web UI the run belongs to the server rather than the tab, so closing
@@ -197,7 +273,8 @@ server running, use cron:
 | `search` | semantic search; `--author`, `--category`, `--since`, `--rerank`, `--scores`, `--full`, `--json` |
 | `similar` | neighbours of a given arXiv id |
 | `serve` | the web UI; `--port`, `--host`, `--no-browser` |
-| `status` | index location, model, counts, cursor |
+| `status` | settings file, index location, model, counts, and per category how far it is complete |
+| `config` | show your settings file, creating it with the defaults if absent |
 | `compact` | reclaim vector slots left behind by re-embedded papers |
 
 `serve` binds to `127.0.0.1` by default. The server exposes the index and,
@@ -205,13 +282,14 @@ indirectly, Ollama, so think before changing `--host`.
 
 ## Source layout
 
-Everything adjustable is in `config.py`, with the measurements behind each
-choice in the comments. Deeper background — why search is brute-force, how the
+How the index is built is in `config.py`, with the measurements behind each
+choice in the comments; what differs between people is in the settings file. Deeper background — why search is brute-force, how the
 reranker was chosen, what was tried and abandoned — is in [NOTES.md](NOTES.md).
 
 | | |
 |---|---|
-| `config.py` | scope, models, paths, tuning |
+| `config.py` | models, tuning |
+| `settings.py` | the per-person settings file: categories, paths, profile |
 | `store.py` | SQLite schema + append-only vector file |
 | `embedder.py` | Ollama embedding calls with retry |
 | `ingest.py` | snapshot scan + the resumable embedding loop |

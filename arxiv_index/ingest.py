@@ -12,7 +12,7 @@ import json
 import sys
 import time
 
-from . import config, embedder, store
+from . import config, embedder, settings, store
 
 
 @contextlib.contextmanager
@@ -23,7 +23,7 @@ def _embed_lock():
     them twice, appending duplicate slots and wasting GPU time. A cron `update`
     firing during a long `build` is the obvious way to hit this.
     """
-    config.INDEX_DIR.mkdir(exist_ok=True)
+    config.INDEX_DIR.mkdir(parents=True, exist_ok=True)
     path = config.INDEX_DIR / "embed.lock"
     with open(path, "w") as handle:
         try:
@@ -55,15 +55,28 @@ def _record(paper: dict) -> dict:
     }
 
 
-def scan_snapshot(db, path=None, chunk: int = 20_000) -> int:
-    """Stream the snapshot and upsert every in-scope paper. Returns the count."""
+def scan_snapshot(db, categories, path=None, chunk: int = 20_000) -> int:
+    """Backfill `categories` from the snapshot. Returns the count in scope.
+
+    Papers already held are left alone (see store.insert_new_papers), so this
+    can add a category to an index that has others, and an interrupted scan
+    can simply be run again. Each category gets its update cursor only once
+    the scan has finished -- that is what marks it as held -- set to the
+    newest date seen, so the next `update` fills in everything since the
+    snapshot was taken.
+    """
     path = path or config.SNAPSHOT
     if not path.exists():
-        raise SystemExit(f"Snapshot not found at {path}")
+        raise SystemExit(
+            f"Snapshot not found at {path}\nDownload it from "
+            "https://www.kaggle.com/datasets/Cornell-University/arxiv, or set "
+            f'"snapshot" in {settings.path()} to where it is.')
 
-    print(f"Scanning {path.name} for {', '.join(config.CATEGORIES)} ...")
+    print(f"Scanning {path.name} for {', '.join(categories)} ...")
     matched = 0
     seen = 0
+    newest = ""
+    found = dict.fromkeys(categories, 0)
     buffer = []
     started = time.monotonic()
 
@@ -73,22 +86,37 @@ def scan_snapshot(db, path=None, chunk: int = 20_000) -> int:
             if seen % 250_000 == 0:
                 print(f"  {seen:,} lines, {matched:,} in scope", flush=True)
             # Cheap substring reject before paying for json.loads on 3.1M lines.
-            if not any(c in line for c in config.CATEGORIES):
+            if not any(c in line for c in categories):
                 continue
             paper = json.loads(line)
-            if not config.in_scope(paper["categories"]):
+            if not config.in_scope(paper["categories"], categories):
                 continue
             matched += 1
+            newest = max(newest, paper.get("update_date") or "")
+            for c in paper["categories"].split():
+                if c in found:
+                    found[c] += 1
             buffer.append(_record(paper))
             if len(buffer) >= chunk:
-                store.upsert_papers(db, buffer)
+                store.insert_new_papers(db, buffer)
                 buffer.clear()
 
     if buffer:
-        store.upsert_papers(db, buffer)
+        store.insert_new_papers(db, buffer)
 
     elapsed = time.monotonic() - started
     print(f"Scanned {seen:,} records in {elapsed:.0f}s; {matched:,} in scope.")
+    empty = [c for c, n in found.items() if not n]
+    if empty:
+        # Most likely a misspelling. Left without a cursor, so it keeps being
+        # reported as not held rather than silently fetching nothing.
+        print(f"No papers at all in {', '.join(empty)} -- check the name "
+              f"against https://arxiv.org/category_taxonomy.")
+    if newest:
+        from . import update
+
+        update.set_cursors(db, {c: update.day_cursor(newest)
+                                for c, n in found.items() if n})
     return matched
 
 

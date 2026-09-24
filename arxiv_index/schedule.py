@@ -10,9 +10,10 @@ config dict and two timestamps, which is what makes the awkward part -- "is a
 run due, given it last ran then?" -- something that can be checked directly
 rather than by waiting around for a scheduler.
 
-The setting lives in the index's `meta` table beside the profile, for the same
-reasons: it belongs to *this* index, it is written transactionally, and it
-travels with papers.db when the index is copied.
+The setting lives in the reader's settings file beside the profile: it is a
+choice made by whoever runs the server, not a property of the index. When a
+run last started is the reverse -- it is about the index, and whoever else
+tops up a shared one should reset the clock too -- so that stays in papers.db.
 
 Two modes, which together are the frequency and the timing:
 
@@ -29,9 +30,8 @@ asleep until 09:00 fires at 09:00, because the useful reading of "daily at
 """
 
 import datetime as dt
-import json
 
-from . import store
+from . import settings, store
 
 KEY = "auto_update"
 LAST_KEY = "auto_update_last"
@@ -81,17 +81,13 @@ def _clean_at(raw) -> str:
     return parsed.strftime("%H:%M")
 
 
-def load(db) -> dict:
-    raw = store.get_meta(db, KEY, "") or ""
-    try:
-        return clean(json.loads(raw))
-    except ValueError:
-        return clean(None)
+def load() -> dict:
+    return clean(settings.get(KEY))
 
 
-def save(db, raw) -> dict:
+def save(raw) -> dict:
     setting = clean(raw)
-    store.set_meta(db, KEY, json.dumps(setting))
+    settings.update(**{KEY: setting})
     return setting
 
 

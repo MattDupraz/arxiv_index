@@ -2,9 +2,9 @@
 
 Layout
 ------
-index/papers.db    one row per in-scope paper. `row` is that paper's slot in
+papers.db          one row per in-scope paper. `row` is that paper's slot in
                    the vector file, or NULL if it has not been embedded yet.
-index/vectors.f16  DIM float16 values per slot, packed back to back. Slot n
+vectors.f16        DIM float16 values per slot, packed back to back. Slot n
                    lives at byte offset n * DIM * 2.
 
 The vector file is append-only. Re-embedding a revised paper appends a new slot
@@ -18,7 +18,7 @@ from datetime import datetime, timezone
 
 import numpy as np
 
-from . import config
+from . import config, settings
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS papers (
@@ -50,7 +50,7 @@ def connect(check_same_thread: bool = True) -> sqlite3.Connection:
     Pass check_same_thread=False to share one connection across threads (the web
     server does this); the caller is then responsible for serialising access.
     """
-    config.INDEX_DIR.mkdir(exist_ok=True)
+    config.INDEX_DIR.mkdir(parents=True, exist_ok=True)
     db = sqlite3.connect(config.DB_PATH, check_same_thread=check_same_thread)
     db.row_factory = sqlite3.Row
     db.execute("PRAGMA journal_mode=WAL")
@@ -60,11 +60,20 @@ def connect(check_same_thread: bool = True) -> sqlite3.Connection:
     db.execute("PRAGMA busy_timeout=10000")
     db.executescript(SCHEMA)
     set_meta_defaults(db)
+    if settings.migrate_legacy(db, config.QUERY_EMBEDDER):
+        print(f"Moved the profile out of the index into {settings.path()}.")
     return db
 
 
 def set_meta_defaults(db: sqlite3.Connection) -> None:
-    for key, value in (("model", config.MODEL), ("dim", str(config.DIM))):
+    # An index from before the prefix was recorded was built with none: it is
+    # stated here as the default rather than taken from the settings, which
+    # may since have changed.
+    had_model = get_meta(db, "model") is not None
+    defaults = (("model", config.MODEL), ("dim", str(config.DIM)),
+                ("document_prefix",
+                 "" if had_model else config.DOCUMENT_PREFIX))
+    for key, value in defaults:
         db.execute("INSERT OR IGNORE INTO meta VALUES (?, ?)", (key, value))
     db.commit()
 
@@ -83,14 +92,22 @@ def set_meta(db: sqlite3.Connection, key: str, value: str) -> None:
 
 
 def check_model(db: sqlite3.Connection) -> None:
-    """Refuse to mix vectors from different models in one file."""
-    stored = get_meta(db, "model")
-    if stored and stored != config.MODEL:
-        raise SystemExit(
-            f"Index was built with {stored!r} but config.MODEL is {config.MODEL!r}.\n"
-            "Vectors from different models are not comparable. Either restore the "
-            "old model name or rebuild the index from scratch."
-        )
+    """Refuse to mix vectors made different ways in one file.
+
+    The query prefix is not checked: it changes only how searches are phrased,
+    not the vectors already stored, so it is safe to experiment with.
+    """
+    for key, current in (("model", config.MODEL), ("dim", str(config.DIM)),
+                         ("document_prefix", config.DOCUMENT_PREFIX)):
+        stored = get_meta(db, key)
+        if stored is not None and stored != current:
+            raise SystemExit(
+                f"Index {config.INDEX_DIR} was built with {key} {stored!r}, but "
+                f"the settings in {settings.path()} give {current!r}.\n"
+                "Vectors made differently are not comparable. Either set "
+                '"embedding" back to what built the index, point "index_dir" '
+                "at a new directory, or rebuild this one from scratch."
+            )
 
 
 # --- Metadata ---------------------------------------------------------------
@@ -118,11 +135,31 @@ ON CONFLICT(id) DO UPDATE SET
 """
 
 
+INSERT_NEW = """
+INSERT OR IGNORE INTO papers (id, version, title, abstract, authors, categories,
+                              update_date, doi, journal_ref, row)
+VALUES (:id, :version, :title, :abstract, :authors, :categories,
+        :update_date, :doi, :journal_ref, NULL)
+"""
+
+
 def upsert_papers(db: sqlite3.Connection, records) -> int:
     """Insert or refresh metadata. Returns how many rows now await embedding."""
     db.executemany(UPSERT, records)
     db.commit()
     return count_pending(db)
+
+
+def insert_new_papers(db: sqlite3.Connection, records) -> None:
+    """Insert papers not already held, leaving existing rows untouched.
+
+    For backfilling a category from the snapshot into an index that already
+    has others. A cross-listed paper may be held already, fetched from the API
+    and newer than the snapshot's copy; an upsert would put the older text
+    back and re-embed it.
+    """
+    db.executemany(INSERT_NEW, records)
+    db.commit()
 
 
 def count_pending(db: sqlite3.Connection) -> int:
@@ -178,7 +215,7 @@ def append_vectors(db: sqlite3.Connection, ids, vectors: np.ndarray) -> None:
         raise ValueError(f"expected {(len(ids), config.DIM)}, got {vectors.shape}")
 
     start = vector_count()
-    config.INDEX_DIR.mkdir(exist_ok=True)
+    config.INDEX_DIR.mkdir(parents=True, exist_ok=True)
     with open(config.VEC_PATH, "ab") as fh:
         fh.write(vectors.tobytes())
         fh.flush()

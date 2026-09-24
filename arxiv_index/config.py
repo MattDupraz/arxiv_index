@@ -1,15 +1,33 @@
-"""Central configuration for the arXiv index."""
+"""How the index is built: the model, the tuning, the measurements behind them.
 
-from pathlib import Path
+What differs between the people using it -- which arXiv categories, where the
+index lives, their profile -- is in their own settings file; see settings.py.
+"""
 
-# --- Corpus scope -----------------------------------------------------------
-# A paper is in scope if ANY of its categories is one of these (i.e. cross-listed
-# papers are included, not just those whose primary category matches).
-CATEGORIES = ("math.AC", "math.AG", "math.CO")
+from . import settings
 
 # --- Embedding model --------------------------------------------------------
-MODEL = "qwen3-embedding:4b"
-DIM = 2560
+# The default, which the numbers below were measured with. The settings file's
+# `embedding` can name another Ollama model; see settings.embedding.
+#
+# Documents are embedded raw. Queries get the Qwen3-Embedding instruct prefix,
+# which is what the model was trained to expect on the query side.
+DEFAULT_EMBEDDING = {
+    "model": "qwen3-embedding:4b",
+    "dim": 2560,
+    "query_prefix": "Instruct: Given a research question, retrieve relevant "
+                    "arXiv paper abstracts\nQuery: ",
+    "document_prefix": "",
+}
+
+EMBEDDING = settings.embedding(DEFAULT_EMBEDDING)
+MODEL = EMBEDDING["model"]
+DIM = EMBEDDING["dim"]
+QUERY_PREFIX = EMBEDDING["query_prefix"]
+DOCUMENT_PREFIX = EMBEDDING["document_prefix"]
+
+# What an embedded query depends on, so caches of them can tell when it changes.
+QUERY_EMBEDDER = {"model": MODEL, "query_prefix": QUERY_PREFIX}
 
 # Ollama runtime options for indexing.
 #   num_ctx    abstracts top out around ~500 tokens; 2048 is generous headroom.
@@ -32,12 +50,6 @@ OLLAMA_OPTIONS = {"num_ctx": 2048, "num_batch": 8192, "num_gpu": 99}
 # minor reordering within it -- and the reranker rescores that shortlist anyway,
 # so the vector stage only has to select the right papers, not order them.
 OLLAMA_QUERY_OPTIONS = {"num_ctx": 2048, "num_batch": 8192, "num_gpu": 0}
-
-# Documents are embedded raw. Queries get the Qwen3-Embedding instruct prefix,
-# which is what the model was trained to expect on the query side.
-QUERY_INSTRUCTION = (
-    "Given a research question, retrieve relevant arXiv paper abstracts"
-)
 
 # --- Reranking ---------------------------------------------------------------
 # A cross-encoder rescores the index's shortlist. It must be a
@@ -124,9 +136,10 @@ GPU_SEARCH = True
 BATCH_SIZE = 64
 
 # --- Storage ----------------------------------------------------------------
-ROOT = Path(__file__).resolve().parent.parent
-SNAPSHOT = ROOT / "arxiv-metadata-oai-snapshot.json"
-INDEX_DIR = ROOT / "index"
+# Both paths come from the reader's settings, defaulting to the repo root.
+ROOT = settings.ROOT
+SNAPSHOT = settings.snapshot()
+INDEX_DIR = settings.index_dir()
 DB_PATH = INDEX_DIR / "papers.db"
 VEC_PATH = INDEX_DIR / "vectors.f16"
 
@@ -144,14 +157,18 @@ def document_text(title: str, abstract: str) -> str:
     """
     title = " ".join(title.split())
     abstract = " ".join(abstract.split())
-    return f"{title}\n\n{abstract}"
+    return f"{DOCUMENT_PREFIX}{title}\n\n{abstract}"
 
 
 def query_text(query: str) -> str:
     """The text that gets embedded for a search query."""
-    return f"Instruct: {QUERY_INSTRUCTION}\nQuery: {query.strip()}"
+    return f"{QUERY_PREFIX}{query.strip()}"
 
 
-def in_scope(categories: str) -> bool:
-    """True if a whitespace-separated category string touches our scope."""
-    return any(c in CATEGORIES for c in categories.split())
+def in_scope(categories: str, scope) -> bool:
+    """True if a whitespace-separated category string touches `scope`.
+
+    ANY of a paper's categories counts, so cross-listed papers are included,
+    not just those whose primary category matches.
+    """
+    return any(c in scope for c in categories.split())

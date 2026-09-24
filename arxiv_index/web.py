@@ -19,6 +19,7 @@ Binds to localhost only: the server exposes the index and, indirectly, Ollama.
 
 import collections
 import datetime as dt
+import html
 import json
 import mimetypes
 import pathlib
@@ -32,8 +33,8 @@ from urllib.parse import parse_qs, unquote, urlparse
 import numpy as np
 
 from . import (cite, config, profile as profile_mod, rerank as rerank_mod,
-               schedule as schedule_mod,
-               search as search_mod, store, textnorm, update as update_mod)
+               schedule as schedule_mod, search as search_mod, settings,
+               store, textnorm, update as update_mod)
 
 # Vendored KaTeX (js, css, woff2 subset). Kept local rather than pulled from a
 # CDN so the UI still works offline and does not phone home.
@@ -50,6 +51,17 @@ class ResidentIndex:
         self._db_lock = threading.RLock()
         self.db = store.connect(check_same_thread=False)
         store.check_model(self.db)
+        # Fixed for the life of the server: the category masks below are built
+        # from this list, so a checkbox for a category added to the settings
+        # since would filter on a mask that does not exist.
+        self.categories = settings.categories()
+        held = update_mod.cursors(self.db)
+        self.missing = [c for c in self.categories if c not in held]
+        # With nothing ticked a search covers the reader's categories -- which
+        # on an index holding only those is everything, and needs no mask. A
+        # shared index may hold others', and those should not appear here.
+        self.default_categories = (
+            self.categories if set(held) - set(self.categories) else None)
         self.ids = []
         self.matrix = None
         self.loaded = 0
@@ -131,7 +143,7 @@ class ResidentIndex:
         # every query. These index the *matrix*, so they must be built from the
         # embedded rows in row order -- never from the metadata table, which is
         # a different length and a different order.
-        masks = {cat: [] for cat in config.CATEGORIES}
+        masks = {cat: [] for cat in self.categories}
         with self._db_lock:
             # Streamed rather than fetchall()'d. The full result is ~65 MB of
             # sqlite3.Row objects, and freeing them does not hand the memory
@@ -217,7 +229,8 @@ class ResidentIndex:
             "embedded": total - pending,
             "pending": pending,
             "model": config.MODEL,
-            "categories": list(config.CATEGORIES),
+            "categories": self.categories,
+            "missing": self.missing,
         }
 
     def _mask(self, categories=None, since=None, until=None, author=None):
@@ -445,36 +458,9 @@ class ResidentIndex:
         return ([meta[i] | {"score": by_id[i]} for i in chosen],
                 time.monotonic() - started)
 
-    # --- The reader's profile ---------------------------------------------
-    # Thin wrappers so handlers never touch the shared connection directly.
-    # save_profile hands the lock down rather than taking it: the embedding
-    # call inside must not run with it held.
-
-    def profile(self) -> dict:
-        with self._db_lock:
-            return profile_mod.load(self.db)
-
-    def save_profile(self, authors, interests, blend=None):
-        return profile_mod.save(self.db, authors, interests, blend,
-                                lock=self._db_lock)
-
-    def interests_vectors(self):
-        """(stacked unit vectors, weights), or (None, None) if none rank."""
-        with self._db_lock:
-            return profile_mod.vectors(self.db)
-
-    # --- The automatic-update setting ---------------------------------------
-    # Same connection and lock as the profile. These are single `meta` rows,
-    # so unlike the embedding call in save_profile there is nothing here worth
-    # releasing the lock for.
-
-    def schedule(self) -> dict:
-        with self._db_lock:
-            return schedule_mod.load(self.db)
-
-    def save_schedule(self, raw) -> dict:
-        with self._db_lock:
-            return schedule_mod.save(self.db, raw)
+    # --- When the index was last topped up ---------------------------------
+    # The profile and the schedule setting live in the settings file and need
+    # no connection; this record is about the index, so it stays in it.
 
     def last_run(self) -> float:
         with self._db_lock:
@@ -710,7 +696,9 @@ class Scheduler:
         while not self._stop.wait(self.TICK):
             try:
                 self.tick()
-            except Exception as exc:    # noqa: BLE001 - a bad tick is not fatal
+            # SettingsError is a SystemExit, and would otherwise end the thread
+            # quietly over a typo in the settings file.
+            except (Exception, settings.SettingsError) as exc:  # noqa: BLE001
                 print(f"auto-update check failed: {exc}", flush=True)
 
     def _last(self) -> float:
@@ -720,7 +708,7 @@ class Scheduler:
     def tick(self, now=None) -> bool:
         """Start a run if one is due. Returns whether it did."""
         now = time.time() if now is None else now
-        setting = self._index.schedule()
+        setting = schedule_mod.load()
         if setting["mode"] == "off":
             return False
         if not schedule_mod.due(setting, self._last(), now):
@@ -736,7 +724,7 @@ class Scheduler:
 
     def status(self, now=None) -> dict:
         now = time.time() if now is None else now
-        setting = self._index.schedule()
+        setting = schedule_mod.load()
         last = self._last()
         return setting | {
             "last_run": last or None,
@@ -838,6 +826,9 @@ def make_handler(index: ResidentIndex, updater: Updater,
             self.server.request_started()
             try:
                 self._route()
+            except settings.SettingsError as exc:
+                # A hand edit broke the file while the server was up.
+                self._json({"error": str(exc)}, 500)
             finally:
                 self.server.request_finished()
 
@@ -875,7 +866,7 @@ def make_handler(index: ResidentIndex, updater: Updater,
                         self._json({"error": "authors and interests must both "
                                              "be lists"}, 400)
                         return
-                    saved, error = index.save_profile(
+                    saved, error = profile_mod.save(
                         authors, interests, body.get("blend"))
                     if error:
                         # The text is stored either way; only the embedding
@@ -891,7 +882,7 @@ def make_handler(index: ResidentIndex, updater: Updater,
                     if body is None:
                         self._json({"error": "expected a JSON body"}, 400)
                         return
-                    index.save_schedule(body)
+                    schedule_mod.save(body)
                     self._json(scheduler.status())
                     return
 
@@ -909,6 +900,8 @@ def make_handler(index: ResidentIndex, updater: Updater,
                     self._json(updater.snapshot())
                     return
                 self._send(b"not found", "text/plain", 404)
+            except settings.SettingsError as exc:
+                self._json({"error": str(exc)}, 500)
             finally:
                 self.server.request_finished()
 
@@ -928,12 +921,14 @@ def make_handler(index: ResidentIndex, updater: Updater,
             return None
 
         def _window(self, params, one):
-            """(categories, since, until, k) for the two listing endpoints.
+            """(categories, since, until, k) for the listing endpoints.
 
+            With no category ticked, `categories` is the reader's own when the
+            index holds others as well; see ResidentIndex.default_categories.
             Returns None after answering with a 400, so the caller just stops.
             """
             cats = [c for c in params.get("cat", [])
-                    if c in config.CATEGORIES]
+                    if c in index.categories] or index.default_categories
             since = one("since") or None
             until = one("until") or None
             for label, value in (("since", since), ("until", until)):
@@ -962,8 +957,8 @@ def make_handler(index: ResidentIndex, updater: Updater,
                 # browser holding yesterday's copy would silently hide new UI.
                 # (The vendored assets under /static are immutable and are
                 # cached aggressively instead.)
-                self._send(page().encode("utf-8"), "text/html; charset=utf-8",
-                           no_store=True)
+                self._send(page(index.categories).encode("utf-8"),
+                           "text/html; charset=utf-8", no_store=True)
                 return
 
             if parsed.path.startswith("/static/"):
@@ -986,7 +981,7 @@ def make_handler(index: ResidentIndex, updater: Updater,
                 return
 
             if parsed.path == "/api/profile":
-                self._json(index.profile())
+                self._json(profile_mod.load())
                 return
 
             if parsed.path == "/api/followed":
@@ -994,7 +989,7 @@ def make_handler(index: ResidentIndex, updater: Updater,
                 if window is None:
                     return
                 cats, since, until, _ = window
-                authors = index.profile()["authors"]
+                authors = profile_mod.load()["authors"]
                 if not authors:
                     self._json({"error": "No followed authors yet. Add some "
                                          "under Profile."}, 400)
@@ -1021,12 +1016,15 @@ def make_handler(index: ResidentIndex, updater: Updater,
                 if window is None:
                     return
                 cats, since, until, k = window
-                profile = index.profile()
+                # Picks up interests typed into the settings file by hand. A
+                # no-op when every entry is already cached.
+                profile_mod.embed_missing()
+                profile = profile_mod.load()
                 if not profile["interests"]:
                     self._json({"error": "No research interests yet. Describe "
                                          "them under Profile."}, 400)
                     return
-                queries, weights = index.interests_vectors()
+                queries, weights = profile_mod.vectors()
                 if queries is None:
                     # Either nothing is embedded yet, or every entry that is
                     # has been turned off with a zero weight. Both leave
@@ -1071,7 +1069,10 @@ def make_handler(index: ResidentIndex, updater: Updater,
                 # Any single criterion is a valid search on its own -- an
                 # author, a category or a date each describe a listing. Only a
                 # request with no criteria at all is rejected, matching the CLI.
-                if not (query or author or since or until or cats):
+                # Ticked boxes, not `cats`, which may be the default scope.
+                ticked = any(c in index.categories
+                             for c in params.get("cat", []))
+                if not (query or author or since or until or ticked):
                     self._json(
                         {"error": "give a query, author, category or date"}, 400)
                     return
@@ -1172,7 +1173,7 @@ def serve(port: int = 8000, host: str = "127.0.0.1", open_browser: bool = True):
     server = GracefulHTTPServer((host, port),
                                 make_handler(index, updater, scheduler))
     url = f"http://{host}:{port}/"
-    setting = index.schedule()
+    setting = schedule_mod.load()
     if setting["mode"] == "interval":
         print(f"Automatic updates: every {setting['hours']:g}h")
     elif setting["mode"] == "daily":
@@ -1514,9 +1515,7 @@ mark { background: var(--accent-soft); color: inherit; }
                         title="Several names, comma-separated, match papers they wrote together"
                         autocomplete="off"></label>
     <span>Categories:</span>
-    <label><input type="checkbox" class="cat" value="math.AC"> math.AC</label>
-    <label><input type="checkbox" class="cat" value="math.AG"> math.AG</label>
-    <label><input type="checkbox" class="cat" value="math.CO"> math.CO</label>
+<!--CATEGORIES-->
 <!--RERANK-->
     <label title="Show the relevance logit and cosine for each hit">
       <input type="checkbox" id="showscores"> Scores</label>
@@ -1726,6 +1725,9 @@ function note(extra) {
   let bits = [];
   if (stats) {
     bits.push(stats.embedded.toLocaleString() + " papers searchable");
+    if (stats.missing.length)
+      bits.push(stats.missing.join(", ") + " not in the index yet — "
+                + "run build to add");
     if (stats.pending > 0)
       bits.push(stats.pending.toLocaleString() + " still embedding — "
                 + "results improve as the build finishes");
@@ -2266,12 +2268,17 @@ cross-encoder that reads query and abstract together. Slower, better ordered.">
       <input type="checkbox" id="rerank" checked> Rerank top 50</label>"""
 
 
-def page() -> str:
-    """The UI, with the rerank control included only if it is usable.
+def page(categories) -> str:
+    """The UI, with a checkbox per category and the rerank control included
+    only if it is usable.
 
     Rebuilt per request rather than cached: `offerable()` is cheap, and a
     reranker that fails at run time -- an out-of-memory, a GPU that went away --
     then stops being offered on the next refresh instead of at the next restart.
     """
     control = RERANK_CONTROL if rerank_mod.offerable() else ""
-    return PAGE.replace("<!--RERANK-->", control)
+    boxes = "\n".join(
+        f'    <label><input type="checkbox" class="cat" value="{c}"> '
+        f"{c}</label>" for c in map(html.escape, categories))
+    return (PAGE.replace("<!--RERANK-->", control)
+            .replace("<!--CATEGORIES-->", boxes))

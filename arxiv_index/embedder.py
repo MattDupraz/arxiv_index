@@ -5,7 +5,7 @@ import time
 import numpy as np
 import ollama
 
-from . import config
+from . import config, settings
 
 
 class EmbedError(RuntimeError):
@@ -32,18 +32,25 @@ def embed(texts, *, retries: int = 4, options=None) -> np.ndarray:
                 options=options,
                 truncate=True,
             )
-            vectors = np.asarray(response.embeddings, dtype=np.float32)
-            if vectors.shape != (len(texts), config.DIM):
-                raise EmbedError(
-                    f"expected {(len(texts), config.DIM)}, got {vectors.shape}"
-                )
-            return vectors
+            break
         except Exception as exc:  # noqa: BLE001 - surfaced after the final retry
             last = exc
             if attempt < retries - 1:
                 time.sleep(2 ** attempt)
+    else:
+        raise EmbedError(
+            f"embedding failed after {retries} attempts: {last}") from last
 
-    raise EmbedError(f"embedding failed after {retries} attempts: {last}") from last
+    # Outside the retries: a wrong dimension is a setting, not a hiccup.
+    vectors = np.asarray(response.embeddings, dtype=np.float32)
+    if vectors.ndim == 2 and vectors.shape[1] != config.DIM:
+        raise EmbedError(
+            f"{config.MODEL} gives {vectors.shape[1]} dimensions, but "
+            f'"embedding.dim" is {config.DIM}. Correct it in {settings.path()}.')
+    if vectors.shape != (len(texts), config.DIM):
+        raise EmbedError(
+            f"expected {(len(texts), config.DIM)}, got {vectors.shape}")
+    return vectors
 
 
 def embed_documents(titles_and_abstracts) -> np.ndarray:

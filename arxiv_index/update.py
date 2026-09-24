@@ -27,6 +27,7 @@ paper only if arXiv itself omits it from a successful response.
 """
 
 import datetime as dt
+import json
 import ssl
 import time
 import urllib.error
@@ -34,7 +35,7 @@ import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 
-from . import config, store
+from . import config, settings, store
 
 API = "https://export.arxiv.org/api/query"
 NS = {
@@ -55,7 +56,11 @@ EMPTY_RETRIES = 3
 # ~100k entries at PAGE_SIZE 200. These categories see ~45 updates/day, so this
 # covers a multi-year absence; a normal run touches one or two pages.
 MAX_PAGES = 500
-CURSOR_KEY = "arxiv_cursor"
+# {category: ISO timestamp}, one cursor per category the index holds. See
+# `cursors` for why per category.
+CURSORS_KEY = "arxiv_cursors"
+# The single cursor this replaced, from when the scope was fixed.
+LEGACY_CURSOR_KEY = "arxiv_cursor"
 
 
 # --- Parsing ----------------------------------------------------------------
@@ -144,18 +149,19 @@ def _opener():
     return _OPENER
 
 
-def _query() -> str:
-    return " OR ".join(f"cat:{c}" for c in config.CATEGORIES)
+def _query(categories) -> str:
+    return " OR ".join(f"cat:{c}" for c in categories)
 
 
-def _fetch(start: int, page_size: int = PAGE_SIZE, retries: int = 4):
+def _fetch(categories, start: int, page_size: int = PAGE_SIZE,
+           retries: int = 4):
     """One page, newest-first. Returns (entries, total_results).
 
     Transport errors are retried with backoff. An empty *successful* response is
     returned as-is; the caller decides whether it means end-of-stream.
     """
     url = API + "?" + urllib.parse.urlencode({
-        "search_query": _query(),
+        "search_query": _query(categories),
         "sortBy": "lastUpdatedDate",
         "sortOrder": "descending",
         "start": start,
@@ -179,15 +185,16 @@ def _fetch(start: int, page_size: int = PAGE_SIZE, retries: int = 4):
     raise RuntimeError(f"arXiv API request failed after {retries} attempts: {last}")
 
 
-def fetch_since(cursor: dt.datetime, max_pages: int = MAX_PAGES, log=print):
-    """Walk newest-first until reaching `cursor`.
+def fetch_since(cursor: dt.datetime, categories, max_pages: int = MAX_PAGES,
+                log=print):
+    """Walk `categories` newest-first until reaching `cursor`.
 
     Returns (records, newest_seen, complete). `complete` is True only if the
     walk actually reached the cursor; the caller must not advance the cursor
     otherwise.
     """
     floor = cursor - OVERLAP
-    log(f"Querying arXiv for {', '.join(config.CATEGORIES)} updated since "
+    log(f"Querying arXiv for {', '.join(categories)} updated since "
         f"{floor:%Y-%m-%d %H:%M} UTC")
 
     records, newest = [], None
@@ -196,7 +203,7 @@ def fetch_since(cursor: dt.datetime, max_pages: int = MAX_PAGES, log=print):
     complete = False
 
     while pages < max_pages:
-        entries, page_total = _fetch(consumed)
+        entries, page_total = _fetch(categories, consumed)
         if total is None:
             total = page_total
 
@@ -223,7 +230,8 @@ def fetch_since(cursor: dt.datetime, max_pages: int = MAX_PAGES, log=print):
             if stamp and stamp < floor:
                 complete = True
                 break
-            if record["id"] and config.in_scope(record["categories"]):
+            if record["id"] and config.in_scope(record["categories"],
+                                                categories):
                 records.append(record)
 
         consumed += len(entries)
@@ -248,22 +256,70 @@ def fetch_since(cursor: dt.datetime, max_pages: int = MAX_PAGES, log=print):
 # --- Cursor -----------------------------------------------------------------
 
 
-def default_cursor(db) -> dt.datetime:
-    """Where to resume from: the stored cursor, else the newest paper we hold."""
-    stored = store.get_meta(db, CURSOR_KEY)
-    if stored:
-        parsed = _parse_stamp(stored)
-        if parsed:
-            return parsed
+def day_cursor(date: str) -> dt.datetime:
+    """Midnight UTC of a bare YYYY-MM-DD, which is all the snapshot records.
+    Starting there re-examines part of that day; the upsert discards what is
+    already held."""
+    return dt.datetime.strptime(date, "%Y-%m-%d").replace(
+        tzinfo=dt.timezone.utc)
 
-    row = db.execute("SELECT MAX(update_date) AS d FROM papers").fetchone()
-    if row and row["d"]:
-        # Snapshot dates are bare days; start at midnight UTC of that day and
-        # let the upsert discard whatever we already have.
-        return dt.datetime.strptime(row["d"], "%Y-%m-%d").replace(
-            tzinfo=dt.timezone.utc
-        )
-    return dt.datetime(1991, 1, 1, tzinfo=dt.timezone.utc)
+
+def cursors(db) -> dict:
+    """{category: how far the index is known complete}, one per category held.
+
+    Per category because categories join the index at different times. One
+    added today is backfilled from a snapshot that may be months old, so its
+    history runs up to the snapshot's date while the others are current; a
+    single cursor would either skip the months in between for the newcomer or
+    re-walk them for everyone on every run.
+
+    A category is only given a cursor once its backfill has finished, so the
+    keys are also the answer to "which categories does this index hold".
+    """
+    stored = store.get_meta(db, CURSORS_KEY)
+    if stored:
+        try:
+            parsed = json.loads(stored)
+        except ValueError:
+            parsed = {}
+        out = {}
+        for cat, stamp in parsed.items() if isinstance(parsed, dict) else ():
+            stamp = _parse_stamp(stamp)
+            if stamp:
+                out[cat] = stamp
+        return out
+
+    # An index from before categories were configurable. Its scope was the
+    # three that were then hard-coded, all sharing one cursor -- or, if it was
+    # never updated, the newest paper held.
+    if not store.count_papers(db):
+        return {}
+    stamp = _parse_stamp(store.get_meta(db, LEGACY_CURSOR_KEY) or "")
+    if stamp is None:
+        row = db.execute("SELECT MAX(update_date) AS d FROM papers").fetchone()
+        stamp = day_cursor(row["d"]) if row and row["d"] else None
+    if stamp is None:
+        return {}
+    out = {cat: stamp for cat in settings.DEFAULT_CATEGORIES}
+    set_cursors(db, out)
+    db.execute("DELETE FROM meta WHERE key = ?", (LEGACY_CURSOR_KEY,))
+    db.commit()
+    return out
+
+
+def set_cursors(db, values: dict) -> None:
+    """Set the cursor of each category in `values`, keeping the rest."""
+    merged = cursors(db) if store.get_meta(db, CURSORS_KEY) else {}
+    merged.update(values)
+    store.set_meta(db, CURSORS_KEY, json.dumps(
+        {cat: stamp.isoformat(timespec="seconds")
+         for cat, stamp in sorted(merged.items())}))
+
+
+def missing(db) -> list:
+    """The reader's categories that this index does not hold yet."""
+    held = cursors(db)
+    return [c for c in settings.categories() if c not in held]
 
 
 def update(db, max_pages: int = MAX_PAGES, log=print, progress=None) -> int:
@@ -272,10 +328,27 @@ def update(db, max_pages: int = MAX_PAGES, log=print, progress=None) -> int:
     `log` takes the narration and `progress` the (done, total) embedding count.
     Both default to the CLI's behaviour; the web UI passes its own so the run
     can be watched from the page that started it.
+
+    Every category the index holds is kept current, not only the reader's:
+    on a shared index, someone else's categories would otherwise go stale
+    whenever it was this reader's server doing the fetching.
+
+    One walk covers them all, back to the oldest cursor, and on success every
+    cursor moves to the same point. A newly backfilled category thus makes one
+    run walk further than usual, after which it is in step with the rest --
+    rather than costing a separate walk, three seconds a page, on every run.
     """
     store.check_model(db)
-    cursor = default_cursor(db)
-    records, newest, complete = fetch_since(cursor, max_pages, log=log)
+    for cat in missing(db):
+        log(f"{cat} is in your settings but not in this index yet; run "
+            f"`build` to backfill it from the snapshot.")
+    held = cursors(db)
+    if not held:
+        log("This index holds no categories yet; run `build` first.")
+        return 0
+    categories = sorted(held)
+    records, newest, complete = fetch_since(min(held.values()), categories,
+                                            max_pages, log=log)
 
     embedded = 0
     if records:
@@ -299,5 +372,5 @@ def update(db, max_pages: int = MAX_PAGES, log=print, progress=None) -> int:
 
     # Advance only after the work lands, and only over ground fully covered.
     if complete and newest:
-        store.set_meta(db, CURSOR_KEY, newest.isoformat(timespec="seconds"))
+        set_cursors(db, {cat: newest for cat in categories})
     return embedded

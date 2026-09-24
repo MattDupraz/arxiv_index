@@ -5,19 +5,16 @@ about, and a list of research interests -- short descriptions, one per thing
 the reader actually works on, each carrying a weight. Both are edited from the
 web UI.
 
-They live in the index's `meta` table, alongside the model name and the update
-cursor, rather than in a file of their own. That table is already where things
-belonging to *this* index go, it is written transactionally with everything
-else, and a profile then travels with the papers it describes when the index is
-copied -- which is the behaviour the README already promises for the two index
-files.
+They live in the reader's settings file (see settings.py), not in the index:
+the profile belongs to a person, and an index may be shared between several,
+or handed to someone else.
 
-Each interest is stored **with its own embedding**, in the same JSON record as
-the text it came from. Keeping the pair together is what makes the invariant
-cheap to hold: an entry can never be ranked by the vector of some earlier
-wording, because there is nowhere for a stale vector to survive. On save, an
-entry whose text is unchanged keeps its vector and costs nothing; only new or
-edited entries are sent to Ollama.
+Each interest's embedding is cached **keyed by its exact text**. That is what
+makes the invariant cheap to hold: an entry can never be ranked by the vector
+of some earlier wording, because a different wording is a different key. An
+entry whose text is unchanged finds its vector and costs nothing; only new or
+edited entries -- including ones typed into the settings file by hand -- are
+sent to Ollama.
 
 Note the descriptions are embedded as *queries*, not as documents: they are
 compared against document vectors, so they need the instruct prefix and the CPU
@@ -33,24 +30,19 @@ say "closest to any one of these" rather than "closest to their average".
 
 import base64
 import binascii
-import contextlib
-import json
 
 import numpy as np
 
-from . import config, search as search_mod, store, textnorm
+from . import config, search as search_mod, settings, textnorm
 
 AUTHORS_KEY = "followed_authors"
 INTERESTS_KEY = "interests"
 BLEND_KEY = "interests_blend"
-# Written by the single-paragraph version of this module. Only ever read, and
-# only when INTERESTS_KEY still holds that version's plain text; see _migrate.
-LEGACY_VECTOR_KEY = "interests_vector"
 
 # Bounds on what the UI may submit. None is a limit anyone will reach by using
 # the thing as intended; they exist so a runaway paste cannot put an unbounded
-# blob in the metadata table. Each embedded interest costs DIM float32s, so the
-# count is what actually matters: 50 x 2560 x 4 is ~500 KB of base64.
+# blob in the settings file. Each embedded interest costs DIM float32s in the
+# cache, so the count is what actually matters: 50 x 2560 x 4 is ~500 KB.
 MAX_AUTHORS = 500
 MAX_INTERESTS = 50
 MAX_INTEREST_CHARS = 2_000
@@ -201,72 +193,29 @@ def _encode(unit) -> str:
         np.asarray(unit, dtype=VECTOR_DTYPE).tobytes()).decode("ascii")
 
 
-def _migrate(db, stored: str) -> list:
-    """Read the single-paragraph format as a one-entry list.
-
-    The paragraph and its vector are both still good -- it is one interest,
-    written long -- so this carries them across rather than making the reader
-    retype and re-embed. Nothing is written here; the next save persists the
-    list format and the legacy keys simply stop being read.
-    """
-    text = " ".join(stored.split())[:MAX_INTEREST_CHARS]
-    if not text:
-        return []
-    return [{"text": text, "weight": DEFAULT_WEIGHT,
-             "vector": store.get_meta(db, LEGACY_VECTOR_KEY, "") or ""}]
+def _interests() -> list:
+    """The interests as written in the settings file, cleaned."""
+    return clean_interests(settings.get(INTERESTS_KEY, []))
 
 
-def _stored_interests(db) -> list:
-    """The interests as stored, vectors included. Corrupt values read empty."""
-    raw = store.get_meta(db, INTERESTS_KEY, "") or ""
-    if not raw:
-        return []
-    try:
-        parsed = json.loads(raw)
-    except ValueError:
-        # Not JSON at all, so it is the paragraph the old version wrote.
-        return _migrate(db, raw)
-    if not isinstance(parsed, list):
-        return []
-    out = []
-    for entry in parsed:
-        if not isinstance(entry, dict):
-            continue
-        text = " ".join(str(entry.get("text", "")).split())
-        if not text:
-            continue
-        vector = entry.get("vector", "")
-        out.append({"text": text[:MAX_INTEREST_CHARS],
-                    "weight": clean_weight(entry.get("weight")),
-                    "vector": vector if isinstance(vector, str) else ""})
-    return out[:MAX_INTERESTS]
+def _cache() -> dict:
+    return settings.read_vector_cache(config.QUERY_EMBEDDER)
 
 
-def load(db) -> dict:
+def load() -> dict:
     """The stored profile, without the vectors themselves.
 
     Each interest reports `embedded` rather than its vector: the caller is a
     JSON response to a browser, which has no use for 10 KB of float32 per entry
     and every reason not to be sent it.
     """
-    raw = store.get_meta(db, AUTHORS_KEY)
-    authors = []
-    if raw:
-        try:
-            parsed = json.loads(raw)
-        except ValueError:
-            parsed = None
-        if isinstance(parsed, list):
-            authors = [str(a) for a in parsed]
-    interests = [
-        {"text": e["text"], "weight": e["weight"],
-         "embedded": _decode(e["vector"]) is not None}
-        for e in _stored_interests(db)
-    ]
+    cache = _cache()
+    interests = [e | {"embedded": _decode(cache.get(e["text"])) is not None}
+                 for e in _interests()]
     return {
-        "authors": authors,
+        "authors": clean_authors(settings.get(AUTHORS_KEY, [])),
         "interests": interests,
-        "blend": clean_blend(store.get_meta(db, BLEND_KEY, DEFAULT_BLEND)),
+        "blend": clean_blend(settings.get(BLEND_KEY, DEFAULT_BLEND)),
         # Kept so the UI can say "ranking is unavailable" without walking the
         # list itself, and so a caller can distinguish "nothing written yet"
         # from "written, but Ollama was down".
@@ -274,7 +223,7 @@ def load(db) -> dict:
     }
 
 
-def vectors(db):
+def vectors():
     """(Q, weights) for ranking: unit rows and the weight beside each.
 
     Only entries that have both a usable vector and a non-zero weight appear. A
@@ -286,9 +235,10 @@ def vectors(db):
     Returns (None, None) when nothing is rankable, which every caller reads as
     "ranking is not available yet".
     """
+    cache = _cache()
     rows, weights = [], []
-    for entry in _stored_interests(db):
-        unit = _decode(entry["vector"])
+    for entry in _interests():
+        unit = _decode(cache.get(entry["text"]))
         if unit is None or entry["weight"] <= 0:
             continue
         rows.append(unit)
@@ -299,64 +249,52 @@ def vectors(db):
             np.asarray(weights, dtype=np.float32))
 
 
-def save(db, authors, interests, blend=None, lock=None):
-    """Store the profile. Returns (profile, error).
+def embed_missing(prune: bool = False) -> list:
+    """Embed every interest the cache has no vector for. Returns the errors.
 
-    An interest is re-embedded only when its text has changed, which is what
-    makes ranking cheap afterwards and what keeps editing one entry from
-    re-billing the other nineteen.
+    Called on save, and again before ranking so that an interest added by
+    editing the settings file is picked up without a trip through the UI.
+    With `prune`, vectors for texts no longer in the list are dropped.
 
-    `lock` is the caller's database lock, taken around each touch of the
-    connection and released for the embedding calls. The web server shares one
-    connection across its handler threads, and an Ollama round trip is far too
-    long to hold that: every search on the page would queue behind it.
-
-    Embedding failures are reported, not raised, and leave those entries stored
-    without a vector -- the honest state, since the text is kept and only
-    ranking by it is unavailable. Entries are written before they are embedded
-    and updated one at a time afterwards, so a failure half way through keeps
-    the successes, and an entry whose text changed never keeps the vector of
-    its previous wording.
+    Failures are reported, not raised, and leave those entries without a
+    vector -- the honest state, since the text is kept and only ranking by it
+    is unavailable. Each success is cached as it lands, so a failure half way
+    through keeps the ones before it.
     """
-    lock = lock if lock is not None else contextlib.nullcontext()
-    authors = clean_authors(authors)
-    wanted = clean_interests(interests)
-
-    with lock:
-        known = {e["text"]: e["vector"] for e in _stored_interests(db)
-                 if _decode(e["vector"]) is not None}
-        # Unchanged text keeps its vector; everything else starts bare and is
-        # filled in below, so no entry is ever left holding an older wording's.
-        entries = [dict(e, vector=known.get(e["text"], "")) for e in wanted]
-        store.set_meta(db, AUTHORS_KEY, json.dumps(authors))
-        store.set_meta(db, INTERESTS_KEY, json.dumps(entries))
-        if blend is not None:
-            store.set_meta(db, BLEND_KEY, str(clean_blend(blend)))
-
+    wanted = [e["text"] for e in _interests()]
+    cache = _cache()
     failures = []
-    for position, entry in enumerate(entries):
-        if entry["vector"]:
+    for text in wanted:
+        if _decode(cache.get(text)) is not None:
             continue
         try:
-            unit = search_mod.embed_query_normalised(entry["text"])
+            unit = search_mod.embed_query_normalised(text)
         except Exception as exc:  # noqa: BLE001 - Ollama down, model missing
             failures.append(str(exc) or exc.__class__.__name__)
             continue
-        entries[position] = dict(entry, vector=_encode(unit))
-        with lock:
-            # Re-read rather than trusting `entries` wholesale: another save
-            # may have landed while this one was waiting on Ollama, and the
-            # loser of that race should not resurrect the list it started from.
-            current = _stored_interests(db)
-            if position < len(current) and (
-                    current[position]["text"] == entry["text"]):
-                current[position]["vector"] = entries[position]["vector"]
-                store.set_meta(db, INTERESTS_KEY, json.dumps(current))
+        settings.merge_vector_cache(config.QUERY_EMBEDDER, {text: _encode(unit)})
+    if prune:
+        settings.merge_vector_cache(config.QUERY_EMBEDDER, {}, keep=set(wanted))
+    return failures
 
+
+def save(authors, interests, blend=None):
+    """Store the profile. Returns (profile, error).
+
+    An interest is embedded only when its text is new, which is what makes
+    ranking cheap afterwards and what keeps editing one entry from re-billing
+    the other nineteen. The text is written first, so it is kept even when
+    Ollama is unreachable.
+    """
+    values = {AUTHORS_KEY: clean_authors(authors),
+              INTERESTS_KEY: clean_interests(interests)}
+    if blend is not None:
+        values[BLEND_KEY] = clean_blend(blend)
+    settings.update(**values)
+
+    failures = embed_missing(prune=True)
     error = None
     if failures:
-        error = (f"{len(failures)} of {len(entries)} interest(s) could not be "
-                 f"embedded: {failures[0]}")
-
-    with lock:
-        return load(db), error
+        error = (f"{len(failures)} of {len(values[INTERESTS_KEY])} interest(s) "
+                 f"could not be embedded: {failures[0]}")
+    return load(), error
