@@ -55,9 +55,41 @@ def print_results(results, full: bool = False, scores: bool = False) -> None:
 # --- Commands ---------------------------------------------------------------
 
 
+def ask_categories() -> None:
+    """On a first build, ask which categories to index and save the answer.
+
+    Only when the settings name none yet and someone is at the terminal: run
+    from a script, the build takes the defaults as it always has, and a
+    settings file that names them is never second-guessed.
+    """
+    if "categories" in settings.load() or not sys.stdin.isatty():
+        return
+    default = " ".join(settings.DEFAULT_CATEGORIES)
+    print("Which arXiv categories should the index cover? Give their full "
+          "names,\nseparated by spaces or commas, e.g. math.AG hep-th cs.LG "
+          "(the list is at\nhttps://arxiv.org/category_taxonomy). More "
+          "categories make a longer build.\n")
+    while True:
+        try:
+            answer = input(f"Categories [{default}]: ")
+        except (EOFError, KeyboardInterrupt):
+            print()
+            raise SystemExit(1)
+        names = answer.replace(",", " ").split() or default.split()
+        wrong = [n for n in names if not settings.CATEGORY.fullmatch(n)]
+        if not wrong:
+            break
+        print(f"Not an arXiv category: {', '.join(wrong)}. Try again.")
+    settings.update(categories=settings.clean_categories(names))
+    print(f"Saved to {settings.path()}; edit \"categories\" there to change "
+          "them later.\n")
+
+
 def cmd_build(args) -> None:
     db = store.connect()
     store.check_model(db)
+    if not args.embed_only:
+        ask_categories()
     if not args.embed_only:
         # Only the categories the index does not hold yet. The rest are kept
         # current by `update`, and the snapshot's copies would be older.
