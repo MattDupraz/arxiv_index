@@ -9,7 +9,7 @@ from pathlib import Path
 import numpy as np
 
 from . import (config, ingest, search as search_mod, settings, store,
-               textnorm, update as update_mod)
+               textnorm, transfer, update as update_mod)
 
 
 # --- Output -----------------------------------------------------------------
@@ -367,6 +367,23 @@ def main(argv=None) -> None:
 
     p = sub.add_parser("compact", help="reclaim slots left by re-embedded papers")
     p.set_defaults(func=cmd_compact)
+
+    p = sub.add_parser("export", help="write the index, embeddings included, "
+                                      "to one file")
+    p.add_argument("file", type=Path, help="e.g. arxiv-index.tar")
+    p.set_defaults(func=lambda args: transfer.export(args.file))
+
+    p = sub.add_parser("import", help="install an index written by export, "
+                                      "or merge one into this one")
+    p.add_argument("file", type=Path)
+    how = p.add_mutually_exclusive_group()
+    how.add_argument("--merge", action="store_true",
+                     help="add its papers to the index already here, keeping "
+                          "the more recent copy of any paper in both")
+    how.add_argument("--replace", action="store_true",
+                     help="overwrite the index already here")
+    p.set_defaults(func=lambda args: transfer.import_(
+        args.file, replace=args.replace, merge=args.merge))
 
     args = parser.parse_args(argv)
     args.func(args)

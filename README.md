@@ -44,6 +44,10 @@ unreranked.
 
 Every command below is run from this directory.
 
+If you have an index exported from another machine, skip steps 3 and 4:
+`python3 -m arxiv_index import arxiv-index.tar` installs it (see
+[Exporting and importing](#exporting-and-importing-an-index)).
+
 **3. Download the arXiv snapshot.** arXiv's API cannot page back far enough to
 fetch the whole history, so the index is first filled from Kaggle's copy of
 arXiv's metadata:
@@ -157,11 +161,36 @@ no category ticked, searches cover **your** categories only. The index still
 holds the dropped one (as it does the categories of an index someone copied to
 you), and `update` keeps every category it holds current.
 
+### Exporting and importing an index
+
+An index, embeddings included, can be written to one file and installed
+elsewhere, to back it up or to spare another machine the build:
+
+```bash
+python3 -m arxiv_index export arxiv-index.tar    # about 6.3 KB per paper
+python3 -m arxiv_index import arxiv-index.tar    # on the other machine
+```
+
+The file holds the papers and their embeddings, not your settings or profile.
+Importing refuses an index built with a different embedding model from the one
+your settings name. Where there is an index already, it needs one of:
+
+| | |
+|---|---|
+| `--merge` | add the export's papers to this index. A paper in both keeps the more recent copy (the later arXiv version, then the later date), with its embedding. A category in both is complete up to the later of the two dates. Nothing needs embedding again |
+| `--replace` | discard this index and install the export in its place |
+
+A running `serve` picks up the result within a few seconds, as it does any
+change to the index. After importing, `update` brings the index up to date,
+and `build` adds any of your categories it does not hold. A merge that
+replaced papers leaves their old vectors unused; `compact` reclaims the space.
+
 ### The two index files are a matched set
 
 `papers.db` is the source of truth: each paper's `row` column names its
 slot in `vectors.f16`, which has no identity of its own. **Back them up
-together.** If they are separated, the vectors can be rebuilt:
+together**, or use `export`, which does. If they are separated, the vectors
+can be rebuilt:
 
 ```bash
 sqlite3 ~/.arxiv_index/papers.db "UPDATE papers SET row = NULL"
@@ -272,7 +301,9 @@ failure mode is wasted work rather than a gap.
 
 Embedding takes an exclusive lock (`embed.lock` in the index directory), so an
 `update` firing during a long `build` exits cleanly. Searching during a build
-is fine.
+is fine: a running `serve` checks the index every few seconds and picks up
+whatever changed, whether from a `build`, `update`, `import` or `compact` run
+in a terminal or by cron, so it never needs restarting for the index's sake.
 
 From the web UI the run belongs to the server rather than the tab, so closing
 the page does not stop it and reopening picks it back up. One runs at a time.
@@ -317,6 +348,8 @@ server running, use cron:
 | `status` | settings file, index location, model, counts, and per category how far it is complete |
 | `config` | show your settings file, creating it with the defaults if absent |
 | `compact` | reclaim vector slots left behind by re-embedded papers |
+| `export FILE` | write the index, embeddings included, to one file |
+| `import FILE` | install an exported index; `--merge` adds it to the one here, `--replace` overwrites it |
 
 `serve` binds to `127.0.0.1` by default. The server exposes the index and,
 indirectly, Ollama, so think before changing `--host`.
@@ -340,6 +373,7 @@ what was tried and abandoned — is in [NOTES.md](NOTES.md).
 | `rerank.py` | cross-encoder reranking of the shortlist |
 | `textnorm.py` | LaTeX author names, folded for matching |
 | `cite.py` | biblatex entries |
+| `transfer.py` | exporting and importing an index |
 | `profile.py` | followed authors + weighted interests, each with its own embedding |
 | `schedule.py` | when the server tops itself up |
 | `web.py` | local web UI (stdlib `http.server`) |

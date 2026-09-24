@@ -22,6 +22,7 @@ import datetime as dt
 import html
 import json
 import mimetypes
+import os
 import pathlib
 import signal
 import threading
@@ -51,17 +52,13 @@ class ResidentIndex:
         self._db_lock = threading.RLock()
         self.db = store.connect(check_same_thread=False)
         store.check_model(self.db)
+        self._db_file = os.stat(config.DB_PATH).st_ino
+        self._vec_file = self._vector_file()
         # Fixed for the life of the server: the category masks below are built
         # from this list, so a checkbox for a category added to the settings
         # since would filter on a mask that does not exist.
         self.categories = settings.categories()
-        held = update_mod.cursors(self.db)
-        self.missing = [c for c in self.categories if c not in held]
-        # With nothing ticked a search covers the reader's categories -- which
-        # on an index holding only those is everything, and needs no mask. A
-        # shared index may hold others', and those should not appear here.
-        self.default_categories = (
-            self.categories if set(held) - set(self.categories) else None)
+        self._read_holdings()
         self.ids = []
         self.matrix = None
         self.loaded = 0
@@ -70,6 +67,8 @@ class ResidentIndex:
         self.torch = None
         # Values that repeat across rows, held once. See _shared().
         self._pool = {}
+        self._version = self._data_version()
+        self._vec_print, self._meta_print = self._fingerprints()
         self.reload()
         self.reload_metadata()
 
@@ -202,25 +201,100 @@ class ResidentIndex:
         self.meta_authors = authors
         self.meta_loaded = len(ids)
 
+    def _read_holdings(self) -> None:
+        """Which categories the index holds, as they bear on the reader's."""
+        held = update_mod.cursors(self.db)
+        self.missing = [c for c in self.categories if c not in held]
+        # With nothing ticked a search covers the reader's categories -- which
+        # on an index holding only those is everything, and needs no mask. A
+        # shared index may hold others', and those should not appear here.
+        self.default_categories = (
+            self.categories if set(held) - set(self.categories) else None)
+
+    @staticmethod
+    def _vector_file():
+        """Which vector file is in place. `compact` swaps in a new one after
+        renumbering the rows, with no commit to announce it."""
+        try:
+            return os.stat(config.VEC_PATH).st_ino
+        except FileNotFoundError:
+            return None
+
+    def _data_version(self) -> int:
+        # Moves whenever another connection -- another process, or the
+        # server's own background runs -- commits to the database.
+        return self.db.execute("PRAGMA data_version").fetchone()[0]
+
+    def _fingerprints(self):
+        """(vectors, metadata): cheap summaries that change when either does.
+
+        The first covers which papers have vectors and in which slots, so it
+        moves when a paper is embedded, re-embedded after a revision, replaced
+        by a merge, or renumbered by `compact`; it reads only the index on
+        `row`. The second covers what reload_metadata() holds -- how many
+        papers, their dates, authors and categories -- and scans the table,
+        tens of milliseconds, so it is only taken once data_version has said
+        something changed.
+        """
+        vectors = self.db.execute(
+            "SELECT COUNT(row), TOTAL(row) FROM papers WHERE row IS NOT NULL"
+        ).fetchone()
+        metadata = self.db.execute(
+            "SELECT COUNT(*), TOTAL(length(authors)), TOTAL(length(categories)),"
+            " TOTAL(julianday(update_date)) FROM papers").fetchone()
+        return tuple(vectors), tuple(metadata)
+
     def refresh_if_stale(self) -> None:
-        """Pick up papers embedded since load. Cheap: the matrix is a memmap, so
-        re-mapping it does not copy, and during a build this keeps results
-        current without restarting the server."""
+        """Pick up whatever changed in the index since it was loaded.
+
+        Called before every search and every few seconds by the server's
+        watcher, so it has to be cheap when nothing changed: one pragma. When
+        something did, only the half that changed is reloaded. During a build
+        the vectors change every few seconds while the metadata does not, and
+        re-folding 145k author strings each time would cost ~0.5s for nothing.
+        Re-mapping the matrix is cheap: it is a memmap, so it does not copy.
+
+        An index replaced outright -- `import --replace` -- is a new file, which
+        the open connection would never see; it is reopened, provided it was
+        built with the model this server searches with, and reloaded whole.
+        """
         with self._db_lock:
-            live = self.db.execute(
-                "SELECT COUNT(*) FROM papers WHERE row IS NOT NULL"
-            ).fetchone()[0]
-            total = self.db.execute("SELECT COUNT(*) FROM papers").fetchone()[0]
-            # Tracked separately on purpose. During a build the embedded count
-            # changes every few seconds while the metadata does not, and
-            # re-folding 145k author strings each search would cost ~0.5s for
-            # nothing. The lock is reentrant, so the reloads can retake it.
-            if live != self.loaded:
+            try:
+                current = os.stat(config.DB_PATH).st_ino
+            except FileNotFoundError:
+                return          # mid-replacement; the next check finds it
+            if current != self._db_file:
+                fresh = store.connect(check_same_thread=False)
+                try:
+                    store.check_model(fresh)
+                except SystemExit as exc:
+                    fresh.close()
+                    self._db_file = current     # say so once, not every check
+                    print(f"The index was replaced, but not reloaded: {exc}",
+                          flush=True)
+                    return
+                self.db.close()
+                self.db, self._db_file, self._version = fresh, current, None
+                self._vec_print = self._meta_print = None
+            version, vec_file = self._data_version(), self._vector_file()
+            if version == self._version and vec_file == self._vec_file:
+                return
+            if vec_file != self._vec_file:
+                self._vec_print = None
+            self._version, self._vec_file = version, vec_file
+            vectors, metadata = self._fingerprints()
+            # The lock is reentrant, so the reloads can retake it.
+            if metadata != self._meta_print:
+                # reload() carries per-paper metadata too, so both.
                 self.reload()
-            if total != self.meta_loaded:
                 self.reload_metadata()
+            elif vectors != self._vec_print:
+                self.reload()
+            self._vec_print, self._meta_print = vectors, metadata
+            self._read_holdings()
 
     def stats(self) -> dict:
+        self.refresh_if_stale()
         with self._db_lock:
             total = store.count_papers(self.db)
             pending = store.count_pending(self.db)
@@ -548,7 +622,8 @@ class Updater:
     resident index's. WAL lets one writer and many readers coexist, whereas
     holding the index lock for the length of a run would stall every search
     behind it. Nothing else is needed to make the new papers searchable: the
-    next query calls refresh_if_stale(), sees the count move and re-maps.
+    watcher, or the next query, calls refresh_if_stale(), which sees the
+    commits and re-maps.
     """
 
     KEEP_LINES = 200        # a normal run prints a handful; a backlog, more
@@ -1181,6 +1256,22 @@ def _valid_date(text: str) -> bool:
         return False
 
 
+WATCH_INTERVAL = 5.0    # seconds between looks at the index for changes
+
+
+def _watch(index: ResidentIndex) -> None:
+    """Keep the resident index in step with the files, whoever changes them:
+    `update` from cron, a `build` or `import` in a terminal, a run started from
+    this page. Searches check too, but a change picked up here is loaded before
+    anyone searches, and the page's counts are right without one."""
+    while True:
+        time.sleep(WATCH_INTERVAL)
+        try:
+            index.refresh_if_stale()
+        except Exception as exc:  # noqa: BLE001 - keep watching regardless
+            print(f"Could not reload the index: {exc}", flush=True)
+
+
 def serve(port: int = 8000, host: str = "127.0.0.1", open_browser: bool = True):
     print("Loading index ...")
     index = ResidentIndex()
@@ -1204,6 +1295,7 @@ def serve(port: int = 8000, host: str = "127.0.0.1", open_browser: bool = True):
         print(f"Automatic updates: daily at {setting['at']}")
     print(f"\n  {url}\n\nCtrl-C (or SIGTERM) to stop.")
     scheduler.start()
+    threading.Thread(target=_watch, args=(index,), daemon=True).start()
     if open_browser:
         threading.Timer(0.5, lambda: webbrowser.open(url)).start()
 
