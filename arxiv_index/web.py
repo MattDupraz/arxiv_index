@@ -893,8 +893,36 @@ class GracefulHTTPServer(ThreadingHTTPServer):
             return self._in_flight
 
 
+def _known_host(header, bound: str) -> bool:
+    """Whether a request's Host names this server rather than some domain
+    that has been pointed at it.
+
+    That is DNS rebinding: a page on evil.example re-resolves its own name to
+    127.0.0.1, and the browser, seeing one origin throughout, lets its scripts
+    read this server's answers. Its requests still say Host: evil.example,
+    which is what gives them away. An IP literal cannot be rebound, so any is
+    accepted -- which is also what lets `--host 0.0.0.0` be reached by address
+    from elsewhere on the network -- as are localhost and the host `serve` was
+    given.
+    """
+    if not header:
+        return False
+    try:
+        name = urlparse("//" + header).hostname
+    except ValueError:
+        return False
+    if not name:
+        return False
+    try:
+        ipaddress.ip_address(name)
+        return True
+    except ValueError:
+        pass
+    return name in ("localhost", bound.lower())
+
+
 def make_handler(index: ResidentIndex, updater: Updater,
-                 scheduler: "Scheduler"):
+                 scheduler: "Scheduler", host: str = "127.0.0.1"):
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
 
@@ -912,9 +940,16 @@ def make_handler(index: ResidentIndex, updater: Updater,
 
         def _same_origin(self) -> bool:
             """Not a request from another site open in the same browser: a
-            cross-site request carries its Origin."""
+            cross-site request carries its Origin. Sound only once the Host
+            has been checked (see _known_host), since a rebound domain is the
+            same origin as itself."""
             origin = self.headers.get("Origin")
             return not origin or urlparse(origin).netloc == self.headers.get("Host")
+
+        def _refuse(self, message: str) -> None:
+            # Any body is left unread, so the connection cannot be reused.
+            self.close_connection = True
+            self._json({"error": message}, 403)
 
         def _trusted(self) -> bool:
             """On this machine, and from this page."""
@@ -1066,6 +1101,9 @@ def make_handler(index: ResidentIndex, updater: Updater,
             # keep-alive connection -- that is not work worth draining for.
             self.server.request_started()
             try:
+                if not _known_host(self.headers.get("Host"), host):
+                    self._refuse("Refused: unrecognised Host.")
+                    return
                 self._route()
             except settings.SettingsError as exc:
                 # A hand edit broke the file while the server was up.
@@ -1076,6 +1114,14 @@ def make_handler(index: ResidentIndex, updater: Updater,
         def do_POST(self):
             self.server.request_started()
             try:
+                if not _known_host(self.headers.get("Host"), host):
+                    self._refuse("Refused: unrecognised Host.")
+                    return
+                # Every POST changes something, and a form or fetch on another
+                # site can send one here without the browser asking first.
+                if not self._same_origin():
+                    self._refuse("Refused: not from this page.")
+                    return
                 # Uploads first, before the body is read: it is the file.
                 target = urlparse(self.path)
                 if target.path in ("/api/import/snapshot", "/api/import/index"):
@@ -1107,10 +1153,6 @@ def make_handler(index: ResidentIndex, updater: Updater,
                     # category added is then offered for import from the
                     # snapshot; one dropped is hidden from searches, not
                     # deleted (see update.update).
-                    if not self._same_origin():
-                        self._json({"error": "Refused: not from this page."},
-                                   403)
-                        return
                     text = str((body or {}).get("categories", ""))
                     if not text.strip():
                         self._json({"error": "List at least one category."},
@@ -1475,7 +1517,7 @@ def serve(port: int = 8000, host: str = "127.0.0.1", open_browser: bool = True):
     updater = Updater(index)
     scheduler = Scheduler(index, updater)
     server = GracefulHTTPServer((host, port),
-                                make_handler(index, updater, scheduler))
+                                make_handler(index, updater, scheduler, host))
     url = f"http://{host}:{port}/"
     setting = schedule_mod.load()
     if setting["mode"] == "interval":
