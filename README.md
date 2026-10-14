@@ -11,6 +11,10 @@ A personal semantic search engine for arXiv, running entirely on your machine.
 
 *Thank you to arXiv for use of its open access interoperability. `arxiv_index` was not reviewed or approved by, nor does it necessarily express or reflect the policies or opinions of, arXiv.*
 
+
+> [!CAUTION]
+> The majority of the code was written by an LLM, run at your own risk!
+
 ## Quick start
 
 You need Python 3.11+ and [Ollama](https://ollama.com). The repository is code
